@@ -481,6 +481,7 @@ enum Code {
   INVALID_NAME = 12;
   FAILED = 13;
   TOO_LARGE = 14;
+  CORRUPT = 15;
 
   // What only a server says.
   UNAUTHENTICATED = 30;   // the login was refused

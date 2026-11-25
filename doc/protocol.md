@@ -157,7 +157,7 @@ document for `DUPLICATE`, where in the text for `INVALID_QUERY`).
 
 | Code | The driver returns |
 | --- | --- |
-| `NOT_FOUND` to `TOO_LARGE` | the error of the public package with that name (`syngo.ErrNotFound`, `*syngo.DuplicateError`, ...) |
+| `NOT_FOUND` to `CORRUPT` | the error of the public package with that name (`syngo.ErrNotFound`, `*syngo.DuplicateError`, ...) |
 | `UNAUTHENTICATED`, `FORBIDDEN`, `NO_DATABASE` | errors of the driver |
 | `STALE` | the driver's concern for a stamp; for a cursor, a token or a transaction, an error of the driver that says what was lost |
 | `BUSY` | nothing: the driver waits as long as the answer says, and sends again |

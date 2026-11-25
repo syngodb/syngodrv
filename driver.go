@@ -56,6 +56,10 @@ func (db *DB) View(ctx context.Context, fn func(tx *Tx) error) error { return Er
 // connection of the pool until then.
 func (db *DB) Begin(ctx context.Context) (*Tx, error) { return nil, ErrNotBuilt }
 
+// BeginView starts a transaction that only reads and that the caller ends itself. The server is
+// told it only reads when it begins, and remembers nothing to check it against.
+func (db *DB) BeginView(ctx context.Context) (*Tx, error) { return nil, ErrNotBuilt }
+
 // Close closes the connections of the handle. Every later operation returns syngo.ErrClosed.
 func (db *DB) Close() error { return nil }
 
