@@ -1,0 +1,522 @@
+// The messages of the SyngoDB Server protocol, version 1. DRAFT of Phase 1: on paper, nothing is
+// generated from this file yet, and nothing is frozen until the driver and the server speak it
+// (Phase 3).
+//
+// How the messages travel (frames, the session, who speaks when) is in ../doc/protocol.md. This
+// file says what each message holds. The rules that hold everywhere:
+//
+//   - A value (the operand of a condition, the argument of a query, a document, a patch, the
+//     metadata of a document) is JSON text in a bytes field. The server checks it.
+//   - A time is a count of nanoseconds since 1970, UTC. Zero is "no time".
+//   - A field that is added later is ignored by whoever does not know it. A message, or a value of
+//     an enumeration, that the server does not know is answered with the error UNSUPPORTED.
+
+syntax = "proto3";
+
+package syngo.wire.v1;
+
+option go_package = "github.com/syngodb/syngodrv/wire";
+
+// ---------------------------------------------------------------------------------------------
+// The session
+// ---------------------------------------------------------------------------------------------
+
+// Hello is the first message of a connection, from the client.
+message Hello {
+  // The versions of the protocol the client speaks, lowest and highest.
+  uint32 protocol_min = 1;
+  uint32 protocol_max = 2;
+  // Who the client is, for the server's log: the driver and its version, the program.
+  string driver = 3;
+  string program = 4;
+  // The database the session works in. Empty for a session that only does what belongs to the
+  // server as a whole.
+  string database = 5;
+  // How the client proves who it is. With neither, the certificate the client showed when the
+  // connection was made is its identity.
+  oneof login {
+    Password password = 6;
+  }
+}
+
+message Password {
+  string user = 1;
+  string password = 2;
+}
+
+// Welcome is the answer to Hello. Any other answer is an Error, after which the server closes.
+message Welcome {
+  // The version both will speak: the highest that both know.
+  uint32 protocol = 1;
+  string server_version = 2;
+  // The role the session has now. It is read again by the server at every request: this is for
+  // the client to know, not a promise.
+  Role role = 3;
+  // The limits of this session, which the client keeps to.
+  uint32 max_frame = 4;      // bytes of one frame
+  uint64 max_message = 5;    // bytes of one message, over all its frames
+  uint32 idle_seconds = 6;   // a session silent for longer is closed; a Ping is not silence
+  uint32 max_cursors = 7;    // answers that may be open at once on the session
+}
+
+enum Role {
+  ROLE_NONE = 0;
+  ROLE_READ = 1;
+  ROLE_WRITE = 2;
+  ROLE_ADMIN = 3;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Requests. One Request travels in one message; its answer is one Response.
+// ---------------------------------------------------------------------------------------------
+
+message Request {
+  // How long the client will wait, in milliseconds; zero for no limit of its own. The server
+  // stops working on a request nobody waits for.
+  uint32 timeout_ms = 1;
+
+  oneof op {
+    Ping ping = 10;
+
+    Get get = 20;
+    Exists exists = 21;
+    Count count = 22;
+    Put put = 23;
+    PutBatch put_batch = 24;
+    Patch patch = 25;
+    Modify modify = 26;
+    Delete delete = 27;
+
+    Query query = 30;
+    Next next = 31;
+    CloseCursor close_cursor = 32;
+
+    Begin begin = 40;
+    Commit commit = 41;
+    Rollback rollback = 42;
+
+    EnsureIndex ensure_index = 50;
+    RebuildIndex rebuild_index = 51;
+    DropIndex drop_index = 52;
+    Indexes indexes = 53;
+    Collections collections = 54;
+    DropCollection drop_collection = 55;
+    Stats stats = 56;
+  }
+}
+
+message Ping {}
+
+message Get {
+  string collection = 1;
+  string id = 2;
+  // Asks for the stamp of the document as well (see Modify). A read that does not ask does not
+  // pay for it.
+  bool stamp = 3;
+}
+
+message Exists {
+  string collection = 1;
+  string id = 2;
+}
+
+message Count {
+  string collection = 1;
+}
+
+message Put {
+  string collection = 1;
+  WriteMode mode = 2;
+  bytes document = 3;
+  Write options = 4;
+}
+
+enum WriteMode {
+  WRITE_PUT = 0;      // store, whether or not a document has the identifier
+  WRITE_INSERT = 1;   // refuse when a document has the identifier
+  WRITE_REPLACE = 2;  // refuse when none has
+}
+
+// PutBatch stores several documents, as Put with WRITE_PUT stores each. Outside a transaction it
+// is one transaction: all or none. A set too large for one message is sent as several batches
+// inside a transaction the driver begins and commits.
+message PutBatch {
+  string collection = 1;
+  repeated bytes documents = 2;
+  Write options = 3;
+}
+
+message Patch {
+  string collection = 1;
+  string id = 2;
+  bytes patch = 3;
+  Write options = 4;
+}
+
+// Modify is the second half of "read, change at the client, write back as one". The client read
+// the document with its stamp, decoded it into a value, and encoded that value before and after
+// its function ran. The server gives the stored document the difference between the two, if and
+// only if the document still has the stamp: otherwise it answers STALE, and the client reads
+// and runs its function again.
+//
+// Inside a transaction the stamp is left empty: the transaction already makes the read and the
+// write one.
+message Modify {
+  string collection = 1;
+  string id = 2;
+  bytes stamp = 3;
+  bytes before = 4;
+  bytes after = 5;
+  Write options = 6;
+}
+
+message Delete {
+  string collection = 1;
+  string id = 2;
+}
+
+// Write is what the options of a write come to.
+message Write {
+  // When the document expires. Not set: the write states nothing (Put, Insert and Replace then
+  // store a document that never expires; Patch and Modify keep what the document had).
+  oneof expiry {
+    bool never = 1;
+    int64 expire_in = 2;   // nanoseconds after the write, by the server's clock
+    Instant expire_at = 3;
+  }
+  // The metadata. Not set: the write states nothing, as above.
+  oneof metadata {
+    bool no_meta = 4;
+    bytes meta = 5;
+  }
+}
+
+// Instant is a time that an int64 of nanoseconds may not hold (a date in the year 9999 that
+// stands for "never"): seconds since 1970 and nanoseconds within the second.
+message Instant {
+  int64 seconds = 1;
+  int32 nanos = 2;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Queries
+// ---------------------------------------------------------------------------------------------
+
+// Query asks a collection a question and says what kind of answer is wanted.
+message Query {
+  string collection = 1;
+
+  // The question: conditions built in the program, or a text of SyngoQL with the values of its
+  // parameters. Neither: every document.
+  oneof filter {
+    Cond where = 2;
+    Text text = 3;
+  }
+
+  // What refines it. Each is a field of its own and never part of a text.
+  // An order that is set, even to nothing, replaces the one the text stated.
+  Orders order = 4;
+  // A limit that is set replaces the one the text stated; unlimited takes it away.
+  oneof window {
+    uint64 limit = 5;
+    bool unlimited = 6;
+  }
+  uint64 offset = 7;
+  // The token of the page before, to resume after it.
+  string after = 8;
+
+  Answer answer = 9;
+  // For ANSWER_PAGE: how many documents the page holds.
+  uint32 page_size = 10;
+}
+
+message Text {
+  string syngoql = 1;
+  map<string, Arg> args = 2;
+}
+
+// Arg is the value of one parameter: one value, or a list of them (for "in :names").
+message Arg {
+  repeated bytes values = 1;
+  bool list = 2;
+}
+
+message Orders {
+  repeated Order by = 1;
+}
+
+message Order {
+  string field = 1;      // empty for the order by relevance
+  bool descending = 2;
+  bool relevance = 3;
+}
+
+enum Answer {
+  ANSWER_DOCUMENTS = 0;  // the documents, in batches
+  ANSWER_IDS = 1;        // their identifiers, in batches
+  ANSWER_COUNT = 2;      // how many there are
+  ANSWER_PAGE = 3;       // page_size documents and the token of what follows
+  ANSWER_DELETE = 4;     // remove them, and say how many were removed
+  ANSWER_EXPLAIN = 5;    // how the query would be answered
+}
+
+// Cond is a condition as the public package describes it: see syngo.Cond and syngo.Op.
+message Cond {
+  Op op = 1;
+  bool negated = 2;
+  string field = 3;           // of a comparison
+  repeated bytes values = 4;  // of a comparison, each as JSON text
+  string language = 5;        // of a full text search that names one
+  repeated Cond conds = 6;    // of OP_AND and OP_OR
+}
+
+// Op has the numbers of syngo.Op.
+enum Op {
+  OP_UNSPECIFIED = 0;
+  OP_AND = 1;
+  OP_OR = 2;
+  OP_EQ = 3;
+  OP_GT = 4;
+  OP_GTE = 5;
+  OP_LT = 6;
+  OP_LTE = 7;
+  OP_BETWEEN = 8;
+  OP_IN = 9;
+  OP_EXISTS = 10;
+  OP_MISSING = 11;
+  OP_CONTAINS = 12;
+  OP_STARTS_WITH = 13;
+  OP_ENDS_WITH = 14;
+  OP_LIKE = 15;
+  OP_MATCHES = 16;
+  OP_MATCHES_ANY = 17;
+}
+
+// Next pulls the next batch of an answer that did not fit in one.
+message Next {
+  uint64 cursor = 1;
+}
+
+// CloseCursor ends an answer the client will read no further.
+message CloseCursor {
+  uint64 cursor = 1;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Transactions. From Begin to Commit or Rollback, every request of the session is part of the
+// transaction.
+// ---------------------------------------------------------------------------------------------
+
+message Begin {
+  // A transaction that only reads: it is never checked against others, and holds nothing back.
+  bool read_only = 1;
+}
+
+message Commit {}
+
+message Rollback {}
+
+// ---------------------------------------------------------------------------------------------
+// Collections and indexes
+// ---------------------------------------------------------------------------------------------
+
+message Index {
+  string name = 1;
+  repeated string fields = 2;
+  bool unique = 3;
+}
+
+message EnsureIndex {
+  string collection = 1;
+  Index index = 2;
+}
+
+message RebuildIndex {
+  string collection = 1;
+  string name = 2;
+}
+
+message DropIndex {
+  string collection = 1;
+  string name = 2;
+}
+
+message Indexes {
+  string collection = 1;
+}
+
+message Collections {}
+
+message DropCollection {
+  string name = 1;
+}
+
+message Stats {}
+
+// ---------------------------------------------------------------------------------------------
+// Responses
+// ---------------------------------------------------------------------------------------------
+
+message Response {
+  oneof result {
+    Error error = 1;
+    Done done = 2;          // the request was done and has nothing to say
+    Document document = 3;  // Get
+    bool found = 4;         // Exists
+    int64 number = 5;       // Count, ANSWER_COUNT, ANSWER_DELETE
+    Stored stored = 6;      // Put, PutBatch
+    Batch batch = 7;        // Query, Next
+    string text = 8;        // ANSWER_EXPLAIN
+    IndexList indexes = 9;
+    NameList names = 10;    // Collections
+    StatsResult stats = 11;
+  }
+}
+
+message Done {}
+
+message Document {
+  string id = 1;
+  bytes json = 2;
+  uint64 revision = 3;
+  sfixed64 modified = 4;
+  sfixed64 expires = 5;
+  bytes meta = 6;
+  // What Modify hands back: a value the server makes from the stored document and checks. It
+  // says nothing to the client, and the way it is made may change.
+  bytes stamp = 7;
+}
+
+message Stored {
+  repeated string ids = 1;
+}
+
+// Batch is a part of an answer. When cursor is not zero the answer goes on: Next pulls the rest,
+// CloseCursor gives it up.
+message Batch {
+  repeated Document documents = 1;
+  repeated string ids = 2;
+  uint64 cursor = 3;
+  // For ANSWER_PAGE: the token of the page that follows, empty when this one is the last.
+  string next_page = 4;
+}
+
+message IndexList {
+  repeated Index indexes = 1;
+}
+
+message NameList {
+  repeated string names = 1;
+}
+
+message StatsResult {
+  repeated CollectionStats collections = 1;
+  int64 disk_bytes = 2;
+  CacheStats cache = 3;
+  EngineStats engine = 4;
+}
+
+message CollectionStats {
+  string name = 1;
+  int64 documents = 2;
+  repeated IndexStats indexes = 3;
+}
+
+message IndexStats {
+  Index index = 1;
+  bool building = 2;
+  bool rebuilding = 3;
+  bool stale = 4;
+}
+
+message CacheStats {
+  int64 budget = 1;
+  int64 used = 2;
+  uint64 hits = 3;
+  uint64 misses = 4;
+  uint64 evictions = 5;
+}
+
+message EngineStats {
+  int64 cache_budget = 1;
+  int64 cache_used = 2;
+  int64 cache_hits = 3;
+  int64 cache_misses = 4;
+  int64 buffered = 5;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Errors
+// ---------------------------------------------------------------------------------------------
+
+// Error is why a request was not done. code is what a program tells apart; message is for
+// people; the detail is what the errors that say more carry.
+message Error {
+  Code code = 1;
+  string message = 2;
+  oneof detail {
+    Duplicate duplicate = 3;
+    BadDocument document = 4;
+    BadQuery query = 5;
+    Conflict conflict = 6;
+    Wait wait = 7;
+  }
+}
+
+enum Code {
+  CODE_UNSPECIFIED = 0;
+
+  // The errors of the public package, one for one.
+  NOT_FOUND = 1;
+  EXISTS = 2;
+  DUPLICATE = 3;
+  CONFLICT = 4;
+  READ_ONLY = 5;
+  TX_DONE = 6;
+  TX_EXPIRED = 7;
+  CLOSED = 8;
+  INVALID_DOCUMENT = 9;
+  INVALID_QUERY = 10;
+  INVALID_INDEX = 11;
+  INVALID_NAME = 12;
+  FAILED = 13;
+  TOO_LARGE = 14;
+
+  // What only a server says.
+  UNAUTHENTICATED = 30;   // the login was refused
+  FORBIDDEN = 31;         // the role of the session does not allow the request
+  NO_DATABASE = 32;       // there is no database of that name
+  STALE = 33;             // what the request stood on is no longer there: a stamp, a cursor, a
+                          // page token or a transaction of data that was replaced
+  BUSY = 34;              // the server asks the client to wait (see Wait) and send again
+  CANCELLED = 35;         // the client cancelled, or stopped waiting
+  UNSUPPORTED = 36;       // a message or a value this server does not know
+  PROTOCOL = 37;          // what was received is not a message of the protocol; the server closes
+  INTERNAL = 38;          // a fault of the server, which its log says more about
+}
+
+message Duplicate {
+  string collection = 1;
+  string index = 2;
+  string holder = 3;
+}
+
+message BadDocument {
+  string reason = 1;
+  int32 offset = 2;   // -1 when the error is not about a place in the text
+}
+
+message BadQuery {
+  string reason = 1;
+  uint32 line = 2;
+  uint32 column = 3;
+  string text = 4;
+}
+
+message Conflict {
+  uint32 attempts = 1;
+}
+
+message Wait {
+  uint32 milliseconds = 1;
+}
