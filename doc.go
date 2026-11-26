@@ -1,7 +1,7 @@
 // Package syngodrv is the Go driver of SyngoDB Server: a database behind a server, used the way
 // an embedded one is.
 //
-//	db, err := syngodrv.Open(ctx, address)
+//	db, err := syngodrv.Open(ctx, "syngodbs://db.example.com/orders", syngodrv.Login(user, password))
 //	defer db.Close()
 //
 //	users := db.Collection("users")
@@ -13,8 +13,11 @@
 // states, which the compiler checks. A program therefore reads the same as one that embeds its
 // database, but for the line that opens.
 //
-// A SKELETON, for now. This is Phase 1 of the Server 7 plan: the types and their methods are
-// here so that the public package is shaped against its second implementer before it is frozen.
-// A query is described and refined for real; whatever would speak to a server returns
-// ErrNotBuilt. The protocol the driver will speak is in doc/protocol.md and wire/syngo.proto.
+// A program that uses several databases of one server makes a Client, and takes its databases
+// from it: they share one pool of connections.
+//
+//	client, err := syngodrv.Connect(ctx, "syngodbs://db.example.com", syngodrv.Login(user, password))
+//	orders := client.Database("orders")
+//
+// How the driver and the server speak is in doc/protocol.md and wire/syngo.proto.
 package syngodrv

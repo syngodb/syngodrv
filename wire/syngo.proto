@@ -1,6 +1,6 @@
-// The messages of the SyngoDB Server protocol, version 1. DRAFT of Phase 1: on paper, nothing is
-// generated from this file yet, and nothing is frozen until the driver and the server speak it
-// (Phase 3).
+// The messages of the SyngoDB Server protocol, version 1, as this driver and the server speak
+// them. Nothing is frozen before a public release. The driver writes and reads them with code
+// written by hand (package wire), which a test holds to the code generated from this file.
 //
 // How the messages travel (frames, the session, who speaks when) is in ../doc/protocol.md. This
 // file says what each message holds. The rules that hold everywhere:
@@ -29,13 +29,10 @@ message Hello {
   // Who the client is, for the server's log: the driver and its version, the program.
   string driver = 3;
   string program = 4;
-  // The database the session works in. Empty for a session that only does what belongs to the
-  // server as a whole.
-  string database = 5;
   // How the client proves who it is. With neither, the certificate the client showed when the
   // connection was made is its identity.
   oneof login {
-    Password password = 6;
+    Password password = 5;
   }
 }
 
@@ -74,6 +71,8 @@ message Request {
   // How long the client will wait, in milliseconds; zero for no limit of its own. The server
   // stops working on a request nobody waits for.
   uint32 timeout_ms = 1;
+  // The database the request is for. Empty for what belongs to the server as a whole.
+  string database = 2;
 
   oneof op {
     Ping ping = 10;
@@ -102,6 +101,11 @@ message Request {
     Collections collections = 54;
     DropCollection drop_collection = 55;
     Stats stats = 56;
+
+    // What belongs to the server as a whole: these name no database in the request.
+    EnsureDatabase ensure_database = 60;
+    DropDatabase drop_database = 61;
+    Databases databases = 62;
   }
 }
 
@@ -221,7 +225,8 @@ message Query {
     uint64 limit = 5;
     bool unlimited = 6;
   }
-  uint64 offset = 7;
+  // An offset that is set, even to zero, replaces the one the text stated.
+  optional uint64 offset = 7;
   // The token of the page before, to resume after it.
   string after = 8;
 
@@ -258,6 +263,9 @@ enum Answer {
   ANSWER_PAGE = 3;       // page_size documents and the token of what follows
   ANSWER_DELETE = 4;     // remove them, and say how many were removed
   ANSWER_EXPLAIN = 5;    // how the query would be answered
+  ANSWER_FIRST = 6;      // the first document of the answer, or NOT_FOUND when there is none. It
+                         // is for the server to work out: a text may state a limit of no
+                         // document, which the client does not see
 }
 
 // Cond is a condition as the public package describes it: see syngo.Cond and syngo.Op.
@@ -304,12 +312,17 @@ message CloseCursor {
 
 // ---------------------------------------------------------------------------------------------
 // Transactions. From Begin to Commit or Rollback, every request of the session is part of the
-// transaction.
+// transaction, which belongs to the database its Begin named.
 // ---------------------------------------------------------------------------------------------
 
 message Begin {
   // A transaction that only reads: it is never checked against others, and holds nothing back.
   bool read_only = 1;
+  // The transaction runs again what the transaction this session committed last had run, which
+  // lost to another (its Commit answered CONFLICT). The server then gives it its turn, as the
+  // embedded library does for a function it runs again, so that a function many clients fight
+  // over finishes. A driver sets it for the second and later attempts of an Update.
+  bool again = 2;
 }
 
 message Commit {}
@@ -354,6 +367,25 @@ message DropCollection {
 message Stats {}
 
 // ---------------------------------------------------------------------------------------------
+// Databases. A database is made on purpose, never by being named in a request for its data.
+// ---------------------------------------------------------------------------------------------
+
+// EnsureDatabase makes sure the server has a database of that name: it makes one when there is
+// none, and changes nothing when there is. A program asks at every start, as it declares its
+// indexes.
+message EnsureDatabase {
+  string name = 1;
+}
+
+// DropDatabase removes a database with everything in it.
+message DropDatabase {
+  string name = 1;
+}
+
+// Databases lists the names of the databases, in order.
+message Databases {}
+
+// ---------------------------------------------------------------------------------------------
 // Responses
 // ---------------------------------------------------------------------------------------------
 
@@ -368,7 +400,7 @@ message Response {
     Batch batch = 7;        // Query, Next
     string text = 8;        // ANSWER_EXPLAIN
     IndexList indexes = 9;
-    NameList names = 10;    // Collections
+    NameList names = 10;    // Collections, Databases
     StatsResult stats = 11;
   }
 }
@@ -414,6 +446,9 @@ message StatsResult {
   int64 disk_bytes = 2;
   CacheStats cache = 3;
   EngineStats engine = 4;
+  CommitStats commits = 5;
+  TxStats transactions = 6;
+  SortStats sorts = 7;
 }
 
 message CollectionStats {
@@ -443,6 +478,31 @@ message EngineStats {
   int64 cache_hits = 3;
   int64 cache_misses = 4;
   int64 buffered = 5;
+}
+
+// CommitStats, TxStats and SortStats are the parts of syngo.Stats of the same names.
+message CommitStats {
+  int64 remembered = 1;
+  int64 bytes = 2;
+  int64 kept = 3;
+  int64 kept_used = 4;
+  int64 kept_budget = 5;
+  uint64 expired = 6;
+}
+
+message TxStats {
+  int64 open = 1;
+  int64 writing = 2;
+  int64 limit = 3;
+  uint64 refused = 4;
+}
+
+message SortStats {
+  uint64 in_memory = 1;
+  uint64 on_disk = 2;
+  int64 each = 3;
+  int64 budget = 4;
+  int64 used = 5;
 }
 
 // ---------------------------------------------------------------------------------------------

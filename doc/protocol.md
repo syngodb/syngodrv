@@ -1,9 +1,9 @@
 # The SyngoDB Server protocol, version 1
 
-**A draft, on paper.** Written in Phase 1 so that the public package is shaped against its second
-implementer before anything is frozen. Nothing speaks it yet: the driver and the server are
-built to it in Phase 3, and what they teach changes this page before a version 1 is promised.
-The messages are defined in [`wire/syngo.proto`](../wire/syngo.proto).
+**A draft that is spoken.** Written on paper in Phase 1, and since Phase 3 what this driver and
+SyngoDB Server speak. It is not promised before a public release: what the next phases teach
+may still change this page. The messages are defined in [`wire/syngo.proto`](../wire/syngo.proto),
+and the driver's package `wire` writes and reads them.
 
 It is our own protocol. The measurements that decided it are in the server's plan: a read costs
 10 µs through it and 46 µs through gRPC.
@@ -11,11 +11,12 @@ It is our own protocol. The measurements that decided it are in the server's pla
 ## In one page
 
 - A client opens a connection, says hello, and logs in once. The connection is then a
-  **session**.
+  **session** with the server, and every request names the database it is for: a program that
+  uses several databases of one server needs one pool of connections, not one for each.
 - A session carries **one request at a time**: a request, then its answer. A driver that wants
   more at once keeps more connections (a pool).
 - A **transaction lives on its session**: from `Begin` to `Commit`, everything the session sends
-  is part of it.
+  is part of it, in the database its `Begin` named.
 - An answer too large for one message is **pulled**, batch by batch. Between two batches the
   session can send something else, so a program can write inside the loop that reads a query.
 - A condition travels **as a description**, a query text **as text with its arguments beside
@@ -33,6 +34,10 @@ It is our own protocol. The measurements that decided it are in the server's pla
 
 A client certificate, when the server accepts or requires one, is shown when the connection is
 made. It is then the identity of the session, and `Hello` carries no password.
+
+A TLS connection asks for the protocol by its name, `syngo` (ALPN). A client of anything else,
+the driver of SyngoDB Server 6 among them, is refused while the connection is made, and never
+left to wait for an answer that would not come.
 
 ## Frames
 
@@ -62,18 +67,28 @@ Everything travels in frames. A frame is a header of 9 bytes and a payload:
 
 ## The session
 
-1. The client sends `Hello`: the versions of the protocol it speaks, who it is (for the log), the
-   database it wants, and a user and password unless its certificate is its identity.
+1. The client sends `Hello`: the versions of the protocol it speaks, who it is (for the log), and
+   a user and password unless its certificate is its identity.
 2. The server answers `Welcome`: the version both will speak, the role of the session, and the
    limits the client must keep to (frame, message, idle time, open answers). Or it answers an
    error and closes.
 3. Requests and answers follow, one at a time.
 
-- **The role is read at every request.** A user whose role changes, or who is removed, loses
-  what they lost at once, on sessions that are already open.
+- **The role is read at every request**, a `Commit` included. A user whose role changes loses
+  what they lost at once, on sessions that are already open. A user who is removed loses the
+  session: its next request, whatever it is, is answered `UNAUTHENTICATED`, the session is
+  closed, and a transaction it had open is given up.
 - **Keep alive.** A session silent for longer than `Welcome` says is closed. `Ping` is a
   request like any other, and is how a pool keeps an idle connection and learns that one died.
-- **A failed login** is answered after a delay that grows, never by locking anyone out.
+  A `CANCEL` frame is not the session speaking, and does not count.
+- **A failed login** is answered after a delay that grows, never by locking anyone out. The
+  delay is counted for the address the logins come from: 100 ms after one failure, twice as
+  long after each more, 5 seconds at most, and forgotten a minute after the last. A right
+  password is always let in, after the wait.
+- **Passwords are checked a few at a time.** A login that could not be looked at within the
+  time a connection has to say who it is (10 seconds) is answered `BUSY`.
+- **An answer must be taken.** A client that takes no part of an answer for 30 seconds loses
+  the session.
 
 ## Requests
 
@@ -92,9 +107,26 @@ Everything travels in frames. A frame is a header of 9 bytes and a payload:
 | `Begin`, `Commit`, `Rollback` | done | the same |
 | `EnsureIndex`, `RebuildIndex`, `DropIndex`, `Indexes` | done, the list | the same |
 | `Collections`, `DropCollection`, `Stats` | the list, done, the figures | the same |
+| `EnsureDatabase`, `DropDatabase`, `Databases` | done, the list | none: an embedded database is a directory |
 
-What belongs to the server as a whole (creating and dropping databases, users and identities,
-backup and restore) comes with the phases that build it, as more requests of the same shape.
+Every request but the last three names its database. **A database is made on purpose**, with
+`EnsureDatabase`: one that is only named is answered `NO_DATABASE`.
+
+What else belongs to the server as a whole (users and identities, backup and restore) comes with
+the phases that build it, as more requests of the same shape.
+
+**What a request may be.** Each bound is a setting of the server with a default, and a request
+beyond one is answered `TOO_LARGE`, with nothing done and the session kept:
+
+- **What it describes.** The lists of a request (documents, conditions, arguments) take 8 MiB
+  at most once they are read, beside the bytes of the message. A message of a few megabytes
+  that says "two million conditions" is refused before the memory is taken.
+- **What its answer would be.** `PutBatch` answers with an identifier for each document, in
+  one message: a batch whose identifiers would not fit is refused before anything is stored.
+  This driver cuts what `PutMany` is given into batches that fit, inside one transaction.
+- **Conditions** nest 200 deep at most. It is the bound of the public package
+  (`syngo.MaxCondDepth`): a program cannot make a condition that cannot travel, and an
+  embedded database refuses the same ones.
 
 ## Queries
 
@@ -103,8 +135,12 @@ A `Query` says what is asked and what kind of answer is wanted:
 - **What is asked**: conditions (`Cond`, a tree of comparisons exactly as `syngo.Cond` describes
   it), or a text of SyngoQL with a value for each of its parameters. Then the order, the limit,
   the offset and the page token, each as a field of its own.
-- **The answer wanted**: the documents, their identifiers, their number, one page, their
-  removal, or the explanation of how the query would be answered.
+- **The answer wanted**: the documents, their identifiers, their number, one page, the first
+  document alone, their removal, or the explanation of how the query would be answered.
+- **What is set replaces what the text stated**, also when it is set to nothing: an order of no
+  field, an offset of zero, a limit taken away. Each of the three says whether it was set.
+- **The first document is the server's to find.** A text may limit its answer to no document,
+  which a client that added "one at most" would overrule without knowing.
 
 **Pulled answers.** Documents and identifiers come in batches. A batch holds as many as fit in
 about 256 KiB, and at least one. When there are more, the batch names a **cursor**:
@@ -114,11 +150,13 @@ about 256 KiB, and at least one. When there are more, the batch names a **cursor
 - A cursor belongs to its session. Outside a transaction a driver keeps the connection out of
   its pool until the answer ends. Inside a transaction the session goes on with other requests
   between two batches: that is what lets a program write inside its loop.
-- The server bounds how many cursors a session holds and how long one may stay unread. A cursor
-  it gave up answers `STALE`.
+- The server bounds how many cursors a session holds (`Welcome` says how many) and how long one
+  may stay unread. A cursor it gave up answers `STALE`.
 
 **Pages.** A page token is made by the server and signed by it: a token that was changed on its
-way through a browser is refused, not obeyed.
+way through a browser is refused, not obeyed. A page is one message: it holds 10,000 documents
+at most, and one whose documents would not fit in a message is answered `TOO_LARGE`, for the
+program to ask for smaller pages. A page is read at one moment of the database, like any answer.
 
 ## Transactions
 
@@ -126,6 +164,11 @@ way through a browser is refused, not obeyed.
   be begun read only: it is then never checked against others.
 - `Update` is the driver's: it begins, runs the program's function, commits, and when the
   commit answers `CONFLICT` it runs the function again, as the embedded library does.
+- **A function that keeps losing still finishes.** The `Begin` of an attempt that runs again
+  says so (`again`), on the session whose last commit lost. The server then gives it its turn,
+  as the embedded library gives one to a function it runs again: it waits for the turn of what
+  it lost on, and after a few losses in a row it runs alone. The turn is held for a moment
+  only (50 ms): the function runs a network away.
 - A transaction left open is ended by the server after a time, or when its connection dies. A
   transaction that lived longer than the server could follow answers `TX_EXPIRED`.
 - **A commit whose answer never came** (the connection died after the request left) is reported
@@ -145,7 +188,7 @@ one. Through a server the function runs at the client, so:
    difference between them, exactly as the embedded library does, **if the document still has
    that stamp**. What the program's type does not declare stays in the document.
 4. Otherwise the server answers `STALE`, and the driver starts again at 1. After three such
-   answers it does the same inside a transaction, which is sure to finish.
+   answers it does the same inside an `Update`, which is sure to finish.
 
 Two round trips, and the server holds nothing between them. The stamp is not the revision: a
 revision begins again at 1 when a document is deleted and stored anew.
@@ -169,6 +212,9 @@ document for `DUPLICATE`, where in the text for `INVALID_QUERY`).
 - A request says how long its client will wait. The server stops working when that has passed.
 - A `CANCEL` frame stops the request of the number it carries, which then answers `CANCELLED`.
   One that arrives after the answer left changes nothing. The session goes on either way.
+- A connection that ends while a request is served stops the request: nobody waits for it.
+- `CANCEL` is the only thing a client may send before its answer. Any other frame ends the
+  session: a client that sends its next request without waiting is refused at the second.
 
 ## Versions
 
@@ -177,10 +223,18 @@ document for `DUPLICATE`, where in the text for `INVALID_QUERY`).
 - Inside a version, messages only grow: a field that is added is ignored by whoever does not
   know it, and a request the server does not know is answered `UNSUPPORTED`.
 
-## Left for Phase 3
+## How the messages are written
 
-| Question | How it is settled |
+As Protocol Buffers writes them, fields in the order of their numbers. This driver writes and
+reads them with code written by hand (package `wire`), which a test holds to the code generated
+from `syngo.proto`: over messages made at random, what either writes the other reads as the same
+message. A driver in another language can use whatever its Protocol Buffers library generates.
+
+## Settled in Phase 3
+
+| Question | Answer |
 | --- | --- |
-| The encoder for the messages (generated code, or written by hand against the wire format) | measured against the targets: 15 µs a read, 16 KiB an idle connection |
-| The size of a batch | measured on the query of 200 documents |
-| The form of the address a program gives the driver | with the names and ports, as the phase opens |
+| The encoder for the messages | written by hand. Measured: the messages of a read cost 0.26 µs against 1.49 with generated code, those of a query answered by 200 documents 23 µs against 72 |
+| The size of a batch | about 256 KiB: a batch is closed by the document that takes it past that |
+| The form of an address | `syngodbs://host[:port][/database]` with TLS and `syngodb://` without, as SyngoDB Server 6 had them, and `syngodb+unix:///path/to/socket[?database=name]`. `?insecure=true` takes whatever certificate the server shows. An address never carries a user or a password |
+| The database of a request | named by each request, where the first draft named it once, in `Hello` |

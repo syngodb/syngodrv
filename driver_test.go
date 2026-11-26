@@ -3,7 +3,9 @@ package syngodrv
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/syngodb/syngo"
 )
@@ -14,18 +16,60 @@ func ask[D syngo.DB[C, T], C syngo.Collection[Q], Q syngo.Query[Q], T syngo.Tx[C
 	return db.Collection("users").Where(syngo.Eq("status", "active")).OrderBy(syngo.Desc("age")).Limit(10).Count(ctx)
 }
 
-func TestTheSkeletonKeepsTheContracts(t *testing.T) {
+// An address says where the server is, and never who logs in.
+func TestAddresses(t *testing.T) {
+	for text, want := range map[string]address{
+		"syngodbs://db.example.com":                 {network: "tcp", address: "db.example.com:31415", host: "db.example.com", secure: true},
+		"syngodbs://127.0.0.1:41415":                {network: "tcp", address: "127.0.0.1:41415", host: "127.0.0.1", secure: true},
+		"syngodbs://127.0.0.1:41415?insecure=true":  {network: "tcp", address: "127.0.0.1:41415", host: "127.0.0.1", secure: true, insecure: true},
+		"syngodbs://127.0.0.1:41415?insecure=false": {network: "tcp", address: "127.0.0.1:41415", host: "127.0.0.1", secure: true},
+		"syngodbs://db/SS_default?insecure=true":    {network: "tcp", address: "db:31415", host: "db", database: "SS_default", secure: true, insecure: true},
+		"syngodb://127.0.0.1:41415":                 {network: "tcp", address: "127.0.0.1:41415", host: "127.0.0.1"},
+		"syngodb://[::1]:41415/orders":              {network: "tcp", address: "[::1]:41415", host: "::1", database: "orders"},
+		"syngodbs://db.example.com/SS_default":      {network: "tcp", address: "db.example.com:31415", host: "db.example.com", database: "SS_default", secure: true},
+		"syngodbs://db/a%20name%20with%20spaces":    {network: "tcp", address: "db:31415", host: "db", database: "a name with spaces", secure: true},
+		"syngodb+unix:///run/syngod.sock":           {network: "unix", address: "/run/syngod.sock"},
+		"syngodb+unix:///run/s.sock?database=main":  {network: "unix", address: "/run/s.sock", database: "main"},
+	} {
+		if got, err := parse(text); err != nil || got != want {
+			t.Errorf("%s: %+v, %v", text, got, err)
+		}
+	}
+	for _, text := range []string{
+		"", "db.example.com", "http://db.example.com", "syngo://db.example.com", "syngodbs://", "syngodb:///orders",
+		"syngodbs://user:password@db.example.com/orders", "syngodb://user@db.example.com", "syngodbs://db.example.com/orders?tls=off",
+		"syngodbs://db.example.com?insecure=yes", "syngodbs://db.example.com?insecure=true&insecure=true", "syngodb://db.example.com?insecure=true",
+		"syngodb+unix://host/run/syngod.sock", "syngodb+unix://", "syngodb+unix:///run/s.sock?other=1", "syngodb+unix:///run/s.sock?database=a&b=c",
+		"syngodb+unix:///run/s.sock?insecure=true",
+	} {
+		if got, err := parse(text); err == nil {
+			t.Errorf("%q is taken for the address %+v", text, got)
+		}
+	}
+	// A password that was put in an address is not repeated by the error that refuses it.
+	if _, err := parse("syngodbs://root:the-secret@db.example.com"); err == nil || strings.Contains(err.Error(), "the-secret") {
+		t.Errorf("the error for an address with a password: %v", err)
+	}
 	ctx := context.Background()
-	db := &DB{}
-	if _, err := ask(ctx, db); !errors.Is(err, ErrNotBuilt) {
-		t.Errorf("got %v", err)
+	if _, err := Connect(ctx, "syngodbs://db.example.com/orders"); err == nil {
+		t.Error("Connect took an address that names a database")
 	}
-	if _, err := Open(ctx, "anywhere"); !errors.Is(err, ErrNotBuilt) {
-		t.Errorf("Open: %v", err)
+	if _, err := Open(ctx, "syngodbs://db.example.com"); err == nil {
+		t.Error("Open took an address that names no database")
 	}
-	if _, err := Update(ctx, db, func(tx *Tx) (int, error) { return 1, nil }); !errors.Is(err, ErrNotBuilt) {
-		t.Errorf("Update: %v", err)
+}
+
+// Code written against the contracts takes the driver's types: a server that is not there is
+// said to be so, by the error of this package for it.
+func TestTheDriverKeepsTheContracts(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	// A port of this machine on which nothing listens.
+	if _, err := Connect(ctx, "syngodb://127.0.0.1:1"); !errors.Is(err, ErrConnection) {
+		t.Errorf("a server that is not there: %v", err)
 	}
+	var db *DB
+	_ = func() (int64, error) { return ask(ctx, db) }
 }
 
 // What can be refused before anything is sent is refused as the embedded library refuses it.
