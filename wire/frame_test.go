@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"math/rand/v2"
+	"slices"
 	"testing"
 	"testing/iotest"
 )
@@ -22,6 +23,11 @@ func frame(kind byte, number uint32, payload []byte) []byte {
 	out[4] = kind
 	binary.BigEndian.PutUint32(out[5:], number)
 	return append(out, payload...)
+}
+
+// announced is the frame that goes before a message in several frames: the length of the whole.
+func announced(kind byte, number uint32, whole int) []byte {
+	return frame(kind|more, number, binary.BigEndian.AppendUint64(nil, uint64(whole)))
 }
 
 func random(r *rand.Rand, n int) []byte {
@@ -50,7 +56,12 @@ func TestWhatIsSentIsRead(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			if want := 3 * (size + HeaderSize*max(1, (size+cut-1)/cut)); conn.Len() != want {
+			want := 3 * (size + HeaderSize*max(1, (size+cut-1)/cut))
+			if size > cut {
+				// A message in several frames is announced by one more.
+				want += 3 * (HeaderSize + AnnounceSize)
+			}
+			if conn.Len() != want {
 				t.Fatalf("%d bytes in frames of %d: %d bytes were written and %d expected", size, cut, conn.Len(), want)
 			}
 			for name, src := range map[string]io.Reader{
@@ -129,15 +140,21 @@ func TestWhatIsNotAFrameIsRefused(t *testing.T) {
 		"a cancel that goes on":           {frame(going(KindCancel), 1, nil), MaxFrame, 1 << 20, ErrFrame},
 		"a frame larger than any may be":  {oversized, MaxFrame, 1 << 30, ErrFrame},
 		"a frame larger than the session": {frame(KindRequest, 1, make([]byte, 5000)), 4096, 1 << 20, ErrTooLarge},
-		"a message larger than the session": {join(frame(going(KindRequest), 1, make([]byte, 3000)), frame(going(KindRequest), 1, make([]byte, 3000)), frame(KindRequest, 1, make([]byte, 3000))),
-			4096, 8000, ErrTooLarge},
-		"a first frame larger than the message may be": {frame(going(KindRequest), 1, make([]byte, 3000)), 4096, 2000, ErrTooLarge},
-		"a message that ends in the middle":            {frame(going(KindRequest), 1, []byte("begun")), MaxFrame, 1 << 20, io.ErrUnexpectedEOF},
-		"frames of two kinds in one message":           {join(frame(going(KindRequest), 1, []byte("a")), frame(KindResponse, 1, []byte("b"))), MaxFrame, 1 << 20, ErrFrame},
-		"frames of two requests in one message":        {join(frame(going(KindRequest), 1, []byte("a")), frame(KindRequest, 2, []byte("b"))), MaxFrame, 1 << 20, ErrFrame},
-		"a cancel inside a message":                    {join(frame(going(KindRequest), 1, []byte("a")), frame(KindCancel, 1, nil)), MaxFrame, 1 << 20, ErrFrame},
-		"a frame that goes on and holds nothing":       {join(frame(going(KindRequest), 1, nil), frame(KindRequest, 1, []byte("b"))), MaxFrame, 1 << 20, ErrFrame},
-		"a later frame that goes on and holds nothing": {join(frame(going(KindRequest), 1, []byte("a")), frame(going(KindRequest), 1, nil), frame(KindRequest, 1, []byte("b"))), MaxFrame, 1 << 20, ErrFrame},
+		// A message in several frames is announced: its first frame holds its length and no more.
+		"a message announced larger than the session":  {announced(KindRequest, 1, 9000), 4096, 8000, ErrTooLarge},
+		"a message of one frame larger than a message": {frame(KindRequest, 1, make([]byte, 3000)), 4096, 2000, ErrTooLarge},
+		"a message that was not announced":             {join(frame(going(KindRequest), 1, []byte("abc")), frame(KindRequest, 1, []byte("d"))), MaxFrame, 1 << 20, ErrFrame},
+		"an announcement of nothing":                   {join(announced(KindRequest, 1, 0), frame(KindRequest, 1, nil)), MaxFrame, 1 << 20, ErrFrame},
+		"an announcement and nothing after it":         {announced(KindRequest, 1, 5), MaxFrame, 1 << 20, io.ErrUnexpectedEOF},
+		"a message that ends in the middle":            {join(announced(KindRequest, 1, 10), frame(going(KindRequest), 1, []byte("begun"))), MaxFrame, 1 << 20, io.ErrUnexpectedEOF},
+		"more than was announced":                      {join(announced(KindRequest, 1, 3), frame(going(KindRequest), 1, []byte("ab")), frame(KindRequest, 1, []byte("cd"))), MaxFrame, 1 << 20, ErrFrame},
+		"more than was announced, and going on":        {join(announced(KindRequest, 1, 3), frame(going(KindRequest), 1, []byte("ab")), frame(going(KindRequest), 1, []byte("cd"))), MaxFrame, 1 << 20, ErrFrame},
+		"less than was announced":                      {join(announced(KindRequest, 1, 5), frame(going(KindRequest), 1, []byte("ab")), frame(KindRequest, 1, []byte("cd"))), MaxFrame, 1 << 20, ErrFrame},
+		"frames of two kinds in one message":           {join(announced(KindRequest, 1, 2), frame(going(KindRequest), 1, []byte("a")), frame(KindResponse, 1, []byte("b"))), MaxFrame, 1 << 20, ErrFrame},
+		"frames of two requests in one message":        {join(announced(KindRequest, 1, 2), frame(going(KindRequest), 1, []byte("a")), frame(KindRequest, 2, []byte("b"))), MaxFrame, 1 << 20, ErrFrame},
+		"a cancel inside a message":                    {join(announced(KindRequest, 1, 2), frame(going(KindRequest), 1, []byte("a")), frame(KindCancel, 1, nil)), MaxFrame, 1 << 20, ErrFrame},
+		"a frame that goes on and holds nothing":       {join(announced(KindRequest, 1, 1), frame(going(KindRequest), 1, nil), frame(KindRequest, 1, []byte("b"))), MaxFrame, 1 << 20, ErrFrame},
+		"a later frame that goes on and holds nothing": {join(announced(KindRequest, 1, 2), frame(going(KindRequest), 1, []byte("a")), frame(going(KindRequest), 1, nil), frame(KindRequest, 1, []byte("b"))), MaxFrame, 1 << 20, ErrFrame},
 	} {
 		reader := NewReader(bytes.NewReader(c.conn))
 		reader.Limits(c.frame, c.message)
@@ -146,7 +163,7 @@ func TestWhatIsNotAFrameIsRefused(t *testing.T) {
 		}
 	}
 	// A message whose last frame holds nothing is one all the same.
-	reader := NewReader(bytes.NewReader(join(frame(going(KindRequest), 7, []byte("whole")), frame(KindRequest, 7, nil))))
+	reader := NewReader(bytes.NewReader(join(announced(KindRequest, 7, 5), frame(going(KindRequest), 7, []byte("whole")), frame(KindRequest, 7, nil))))
 	if kind, number, payload, err := reader.Next(); err != nil || kind != KindRequest || number != 7 || string(payload) != "whole" {
 		t.Errorf("a message whose last frame holds nothing: %q, %v", payload, err)
 	}
@@ -236,6 +253,8 @@ func FuzzReader(f *testing.F) {
 func FuzzSend(f *testing.F) {
 	f.Add([]byte("a message"), uint16(4), uint32(7))
 	f.Add([]byte{}, uint16(1), uint32(0))
+	// Found by this target on Windows: a message shorter than the frame that announces it.
+	f.Add([]byte("ab"), uint16(1), uint32(0))
 	f.Fuzz(func(t *testing.T, payload []byte, cut uint16, number uint32) {
 		if cut == 0 || len(payload)/int(cut) > 10_000 {
 			return
@@ -251,6 +270,35 @@ func FuzzSend(f *testing.F) {
 			t.Fatalf("%d bytes in frames of %d: kind %d, number %d, %d bytes, %v", len(payload), cut, kind, got, len(read), err)
 		}
 	})
+}
+
+// The limit of a message is for the message. The frame that announces one in several frames
+// holds 8 bytes and is no part of it: a session whose messages may be shorter than that still
+// reads every message it allows, in frames of any size, and refuses one byte more.
+func TestTheLimitOfAMessageIsNotForItsAnnouncement(t *testing.T) {
+	for limit := 1; limit <= 2*AnnounceSize; limit++ {
+		for size := 2; size <= limit+1; size++ {
+			for cut := 1; cut < size; cut++ {
+				payload := bytes.Repeat([]byte{'m'}, size)
+				var conn bytes.Buffer
+				if err := Send(&conn, cut, KindRequest, 9, message(payload)); err != nil {
+					t.Fatal(err)
+				}
+				reader := NewReader(&conn)
+				reader.Limits(MaxFrame, limit)
+				kind, number, read, err := reader.Next()
+				if size > limit {
+					if err != ErrTooLarge {
+						t.Fatalf("%d bytes in frames of %d, where a message may hold %d: %v", size, cut, limit, err)
+					}
+					continue
+				}
+				if err != nil || kind != KindRequest || number != 9 || !bytes.Equal(read, payload) {
+					t.Fatalf("%d bytes in frames of %d, where a message may hold %d: kind %d, number %d, %d bytes, %v", size, cut, limit, kind, number, len(read), err)
+				}
+			}
+		}
+	}
 }
 
 // While the message read last is still in use, the header of what follows is read on the side:
@@ -405,5 +453,103 @@ func TestAMessageThatArrivesWholeIsReadAtOnce(t *testing.T) {
 	}
 	if src.reads != len(sizes) {
 		t.Errorf("%d messages, each smaller than the room of a reader and arrived whole, took %d reads", len(sizes), src.reads)
+	}
+}
+
+// counted is a connection that counts what was read from it, and hands out no more than it was
+// allowed to: as a peer that sends its next message when the one before it was answered.
+type counted struct {
+	data        []byte
+	read, until int
+}
+
+func (c *counted) Read(p []byte) (int, error) {
+	if c.read >= c.until {
+		return 0, io.EOF
+	}
+	n := copy(p, c.data[c.read:c.until])
+	c.read += n
+	return n, nil
+}
+
+// A reader that is asked to announces every message longer than it is told, once, with its
+// length, when it has read no more of the connection than it reads to find a message: so that
+// whoever needs room for a large message can make it, or wait for it, before the message is
+// taken. What the announcement says is held to: see TestWhatIsNotAFrameIsRefused.
+func TestALongMessageIsAnnouncedBeforeItIsRead(t *testing.T) {
+	r := rand.New(rand.NewPCG(5, 11))
+	for _, cut := range []int{4096, MaxFrame} {
+		var conn bytes.Buffer
+		sizes := []int{10, 500_000, 70, 3_000_000, 64 << 10, 64<<10 + 1, 0, 1 << 20, 1<<20 + 1}
+		var sent [][]byte
+		var ends []int
+		for i, size := range sizes {
+			sent = append(sent, random(r, size))
+			if err := Send(&conn, cut, KindRequest, uint32(i+1), message(sent[i])); err != nil {
+				t.Fatal(err)
+			}
+			ends = append(ends, conn.Len())
+		}
+		src := &counted{data: conn.Bytes()}
+		reader := NewReader(src)
+		reader.Limits(MaxFrame, 8<<20)
+		var told []int
+		taken := 0 // the bytes of the messages that were handed out, with their frames
+		reader.Over = 64 << 10
+		reader.Announce = func(length int) error {
+			told = append(told, length)
+			// What was read of the message before it is announced: a header or two, and what the
+			// reader reads with them into the room it holds, which is never more than a reader
+			// holds without asking (Over, when the messages before were that long).
+			if ahead := src.read - taken; ahead > 2*HeaderSize+AnnounceSize+reader.Over+keep {
+				t.Errorf("frames of %d: a message of %d bytes is announced when %d bytes were read of it already", cut, length, ahead)
+			}
+			return nil
+		}
+		for i := range sizes {
+			src.until = ends[i]
+			_, number, payload, err := reader.Next()
+			if err != nil || number != uint32(i+1) || !bytes.Equal(payload, sent[i]) {
+				t.Fatalf("frames of %d, message %d: number %d, %d bytes, %v", cut, i, number, len(payload), err)
+			}
+			if reader.Pending() != 0 || src.read != ends[i] {
+				t.Fatalf("frames of %d, message %d: %d bytes read of %d, %d waiting", cut, i, src.read, ends[i], reader.Pending())
+			}
+			taken = src.read
+			// A session gives the room of a large message back when it has answered it.
+			if len(payload) > reader.Over {
+				reader.Release()
+			}
+		}
+		if want := []int{500_000, 3_000_000, 64<<10 + 1, 1 << 20, 1<<20 + 1}; !slices.Equal(told, want) {
+			t.Errorf("frames of %d: the messages announced were %v, want %v", cut, told, want)
+		}
+	}
+	// What the announcement answers is what Next answers, and nothing more is read.
+	var conn bytes.Buffer
+	_ = Send(&conn, MaxFrame, KindRequest, 1, message(make([]byte, 300_000)))
+	_ = Send(&conn, MaxFrame, KindRequest, 2, message(make([]byte, 5_000_000)))
+	for i, limit := range []int{1000, 400_000} {
+		src := &counted{data: conn.Bytes(), until: conn.Len()}
+		reader := NewReader(src)
+		reader.Limits(MaxFrame, 8<<20)
+		refused := errors.New("no room")
+		reader.Over = limit
+		reader.Announce = func(int) error { return refused }
+		var err error
+		var kind byte
+		var number uint32
+		for n := 0; err == nil && n < 3; n++ {
+			kind, number, _, err = reader.Next()
+		}
+		// The message that was refused is named: whoever refuses it can answer it.
+		if err != refused || kind != KindRequest || number != uint32(i+1) {
+			t.Errorf("an announcement that is refused: kind %d, number %d, %v", kind, number, err)
+		}
+		// The first message was read, and with it as much of the second as the room of the
+		// first had left: a peer that sends ahead of its answers is read ahead that far.
+		if most := []int{keep, 2*(300_000+HeaderSize) + keep}[i]; src.read > most {
+			t.Errorf("after an announcement was refused %d bytes of the connection were read, and %d at the most were to be", src.read, most)
+		}
 	}
 }

@@ -139,6 +139,9 @@ type address struct {
 //	syngodbs://host[:port][/database][?insecure=true]   TCP with TLS
 //	syngodb://host[:port][/database]                    TCP without
 //	syngodb+unix:///path/to/socket[?database=name]      the Unix socket of the same machine
+//
+// On Windows the path of a socket is written as in the address of any file, with its drive after
+// the third stroke: syngodb+unix:///C:/path/to/socket.
 func parse(text string) (address, error) {
 	u, err := url.Parse(text)
 	if err != nil {
@@ -173,7 +176,7 @@ func parse(text string) (address, error) {
 		if u.Host != "" || u.Path == "" || u.Fragment != "" || len(query) > 1 || (len(query) == 1 && !query.Has("database")) {
 			return address{}, fmt.Errorf("syngodrv: the address %q is not syngodb+unix:///path/to/socket[?database=name]", text)
 		}
-		return address{network: "unix", address: u.Path, database: query.Get("database")}, nil
+		return address{network: "unix", address: socketPath(u.Path, runtime.GOOS == "windows"), database: query.Get("database")}, nil
 	}
 	return address{}, fmt.Errorf("syngodrv: the address %q begins with none of syngodbs://, syngodb:// and syngodb+unix://", text)
 }
@@ -201,6 +204,18 @@ func (c *Client) room() int {
 	return int(min(max(c.message.Load(), 128<<10)-64<<10, 1<<30))
 }
 
+// socketPath is the path of a socket as the system takes it, from the path of an address. On
+// Windows the stroke that stands before the drive goes, and the others are turned.
+func socketPath(path string, windows bool) string {
+	if !windows {
+		return path
+	}
+	if len(path) >= 3 && path[0] == '/' && path[2] == ':' && (path[1]|0x20 >= 'a' && path[1]|0x20 <= 'z') {
+		path = path[1:]
+	}
+	return strings.ReplaceAll(path, "/", `\`)
+}
+
 // Connect makes a client of the server at an address:
 //
 //	syngodbs://host:port            TCP with TLS, the certificate of the server checked
@@ -208,6 +223,7 @@ func (c *Client) room() int {
 //	syngodbs://host?insecure=true   the same, whatever certificate the server shows
 //	syngodb://host:port             TCP without TLS, which a server takes from its own machine only
 //	syngodb+unix:///path/to/sock    the Unix socket of a server on the same machine
+//	syngodb+unix:///C:/path/to/sock the same on Windows
 //
 // These are the addresses SyngoDB Server 6 took: an address written for it still says where the
 // server is.
@@ -340,7 +356,9 @@ func (c *Client) give(cn *conn) {
 }
 
 // Close closes the connections of the client. Every later operation, on the client and on the
-// databases reached through it, returns syngo.ErrClosed.
+// databases reached through it, returns syngo.ErrClosed. A transaction that is open, and an
+// answer that is still read, keep their connection until they end: it is closed then. One that
+// is never ended keeps it until the server ends the transaction and closes the silent session.
 func (c *Client) Close() error {
 	c.mu.Lock()
 	idle := c.idle

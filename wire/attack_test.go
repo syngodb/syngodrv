@@ -59,8 +59,9 @@ func TestAttackFixedAMessageInOneFrameIsNotHeldToTheLimitOfAMessage(t *testing.T
 	if !errors.Is(err, ErrTooLarge) {
 		t.Errorf("a message of %d bytes in one frame, on a session that allows messages of %d: the reader handed out %d bytes (%v), and ErrTooLarge was expected", len(payload), allowed, len(got), err)
 	}
-	// The same bytes cut in two frames are refused: the limit depends on how the peer cuts.
-	cut := bytes.Join([][]byte{frame(KindRequest|more, 1, payload[:2500]), frame(KindRequest, 1, payload[2500:])}, nil)
+	// The same bytes cut in two frames, and announced as a message in several is, are refused
+	// too: the limit does not depend on how the peer cuts.
+	cut := bytes.Join([][]byte{announced(KindRequest, 1, len(payload)), frame(KindRequest|more, 1, payload[:2500]), frame(KindRequest, 1, payload[2500:])}, nil)
 	reader = NewReader(bytes.NewReader(cut))
 	reader.Limits(MaxFrame, allowed)
 	if _, _, _, err := reader.Next(); !errors.Is(err, ErrTooLarge) {
@@ -293,10 +294,11 @@ func TestAttackHeldWhatAReaderHoldsBeforeTheLogin(t *testing.T) {
 		t.Fatalf("a header and nothing after it: %v", err)
 	}
 	afterHeader := cap(reader.buf) + cap(reader.whole)
-	// A first frame one byte short of the limit, and the header of a second.
+	// A message announced as long as one may be: a first frame one byte short of that, and the
+	// header of a second.
 	second := frame(KindHello, 0, nil)
 	binary.BigEndian.PutUint32(second, 1)
-	reader = NewReader(bytes.NewReader(append(frame(KindHello|more, 0, make([]byte, LoginFrame-1)), second...)))
+	reader = NewReader(bytes.NewReader(bytes.Join([][]byte{announced(KindHello, 0, LoginFrame), frame(KindHello|more, 0, make([]byte, LoginFrame-1)), second}, nil)))
 	if _, _, _, err := reader.Next(); err != io.ErrUnexpectedEOF {
 		t.Fatalf("a message that ends after the header of its second frame: %v", err)
 	}
@@ -318,7 +320,7 @@ func TestAttackHeldAMessageInFramesOfOneByte(t *testing.T) {
 		if err := Send(&conn, 1, KindRequest, 1, message(make([]byte, size))); err != nil {
 			t.Fatal(err)
 		}
-		if conn.Len() != size*(HeaderSize+1) {
+		if conn.Len() != size*(HeaderSize+1)+HeaderSize+AnnounceSize {
 			t.Fatalf("%d bytes were written for a message of %d in frames of one", conn.Len(), size)
 		}
 		var took time.Duration
@@ -547,8 +549,15 @@ func TestAttackHeldTheReaderKeepsItsPlace(t *testing.T) {
 				if size/cut > 500 {
 					cut = MaxFrame
 				}
-				for at := 0; ; at += cut {
-					it.frames = append(it.frames, it.start+at+len(it.frames)*HeaderSize)
+				// A message in several frames is announced by a frame of its own, which is its
+				// first: the reader stands in the middle of the message once it has read that one.
+				begins := it.start
+				if size > cut {
+					it.frames = append(it.frames, begins)
+					begins += HeaderSize + AnnounceSize
+				}
+				for at, n := 0, 0; ; at, n = at+cut, n+1 {
+					it.frames = append(it.frames, begins+at+n*HeaderSize)
 					if size-at <= cut {
 						break
 					}

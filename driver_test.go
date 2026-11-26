@@ -3,6 +3,7 @@ package syngodrv
 import (
 	"context"
 	"errors"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -28,8 +29,8 @@ func TestAddresses(t *testing.T) {
 		"syngodb://[::1]:41415/orders":              {network: "tcp", address: "[::1]:41415", host: "::1", database: "orders"},
 		"syngodbs://db.example.com/SS_default":      {network: "tcp", address: "db.example.com:31415", host: "db.example.com", database: "SS_default", secure: true},
 		"syngodbs://db/a%20name%20with%20spaces":    {network: "tcp", address: "db:31415", host: "db", database: "a name with spaces", secure: true},
-		"syngodb+unix:///run/syngod.sock":           {network: "unix", address: "/run/syngod.sock"},
-		"syngodb+unix:///run/s.sock?database=main":  {network: "unix", address: "/run/s.sock", database: "main"},
+		"syngodb+unix:///run/syngod.sock":           {network: "unix", address: socketPath("/run/syngod.sock", runtime.GOOS == "windows")},
+		"syngodb+unix:///run/s.sock?database=main":  {network: "unix", address: socketPath("/run/s.sock", runtime.GOOS == "windows"), database: "main"},
 	} {
 		if got, err := parse(text); err != nil || got != want {
 			t.Errorf("%s: %+v, %v", text, got, err)
@@ -45,6 +46,27 @@ func TestAddresses(t *testing.T) {
 		if got, err := parse(text); err == nil {
 			t.Errorf("%q is taken for the address %+v", text, got)
 		}
+	}
+	// The path of a socket, as each system takes it. On Windows it is written as in the address
+	// of any file, and the path the system is given has its drive first and its own strokes.
+	for _, c := range []struct {
+		path    string
+		windows bool
+		want    string
+	}{
+		{"/run/syngod.sock", false, "/run/syngod.sock"},
+		{"/C:/odd/name.sock", false, "/C:/odd/name.sock"},
+		{"/C:/ProgramData/Syncplify/syngod.sock", true, `C:\ProgramData\Syncplify\syngod.sock`},
+		{"/d:/data/s.sock", true, `d:\data\s.sock`},
+		{"/run/s.sock", true, `\run\s.sock`},
+		{"/1:/s.sock", true, `\1:\s.sock`},
+	} {
+		if got := socketPath(c.path, c.windows); got != c.want {
+			t.Errorf("the socket of the path %q, on Windows %v: %q", c.path, c.windows, got)
+		}
+	}
+	if got, err := parse("syngodb+unix:///C:/data/s.sock?database=main"); err != nil || got.address != socketPath("/C:/data/s.sock", runtime.GOOS == "windows") || got.database != "main" {
+		t.Errorf("an address with a drive: %+v, %v", got, err)
 	}
 	// A password that was put in an address is not repeated by the error that refuses it.
 	if _, err := parse("syngodbs://root:the-secret@db.example.com"); err == nil || strings.Contains(err.Error(), "the-secret") {

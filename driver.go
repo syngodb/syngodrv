@@ -23,6 +23,7 @@ type DB struct {
 //	syngodbs://host:port/name
 //	syngodb://host:port/name
 //	syngodb+unix:///path/to/sock?database=name
+//	syngodb+unix:///C:/path/to/sock?database=name   on Windows
 //
 // It is Connect followed by Database, in one line, and Close closes the connections. When the
 // server has no database of that name it returns an error that is ErrNoDatabase: a database is

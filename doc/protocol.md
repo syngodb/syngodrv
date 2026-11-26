@@ -61,6 +61,12 @@ Everything travels in frames. A frame is a header of 9 bytes and a payload:
   but the last with the flag set. A frame is at most 1 MiB (64 KiB before the login), so that
   no connection holds more than that for a peer that has said nothing useful yet. A whole
   message is at most what `Welcome` says, which follows the server's limit for a document.
+- **Such a message is announced.** Before its frames goes one more, of the same kind and
+  number and with the flag set, whose payload is the length of the whole message: 8 bytes, big
+  endian. The reader knows what is coming before it has taken any of it: a message longer than
+  it accepts is refused there, and a server that has no room for a large request leaves it in
+  the network until it has. The frames that follow hold exactly what was announced: more, or
+  less, is not a message.
 - **Request numbers** are chosen by the client, each greater than the one before. An answer
   carries the number of its request.
 - A frame that is not one of these, or that comes out of turn, ends the session.
@@ -127,6 +133,35 @@ beyond one is answered `TOO_LARGE`, with nothing done and the session kept:
 - **Conditions** nest 200 deep at most. It is the bound of the public package
   (`syngo.MaxCondDepth`): a program cannot make a condition that cannot travel, and an
   embedded database refuses the same ones.
+- **A user who may only read** sends no request longer than those lists and a megabyte (9 MiB
+  with the defaults): a longer one is refused when it is announced.
+
+**What a server may make a client wait for, and what it ends.** All of these are settings of
+the server, and a client needs to know only what it is told:
+
+- **Room.** The server has a budget of memory for the requests it serves at once. A message
+  longer than 64 KiB waits for room before the server reads it, and again before it is served;
+  an answer waits before it is made. The client sees a request that takes longer. A request
+  that finds no room for as long as a session may stay silent is answered `BUSY`, with nothing
+  done: it is sent again later.
+- **A rate.** A user who makes more requests a second than it may is answered `BUSY` with the
+  time to wait, and nothing is done. This driver waits that long and sends the request again.
+- **A full server** answers the hello with `BUSY` and closes the connection.
+- **Time.** A message that has begun has 30 seconds for each megabyte, to arrive and to be
+  taken: a client that stops in the middle of one loses its session. A transaction that is
+  asked nothing for 2 minutes, or is kept for more than an hour, is ended by the server: what
+  is asked in it afterwards is answered `TX_EXPIRED`, until the client commits it (which is
+  answered so too) or rolls it back. An answer that is not pulled further for 5 minutes is
+  given up, and pulling it then is answered `STALE`.
+- **What transactions hold.** What a transaction wrote and what it remembers of its reads stay
+  in the server's memory until it ends. One transaction has a bound of its own (64 MiB by
+  default), past which its next read or write is answered `TOO_LARGE`. What all of them hold
+  together, beyond 64 KiB each, is counted in the budget above: a transaction that finds no
+  room there is ended by the server, and what is asked in it afterwards is answered
+  `TOO_LARGE`, until the client commits it (which is answered so too) or rolls it back. One
+  transaction alone is never ended for this. The commit of a transaction that is counted
+  waits for room as a long message does, and is answered `BUSY` when it finds none in time:
+  nothing was done, the transaction is still open, and the commit is sent again.
 
 ## Queries
 
@@ -236,5 +271,5 @@ message. A driver in another language can use whatever its Protocol Buffers libr
 | --- | --- |
 | The encoder for the messages | written by hand. Measured: the messages of a read cost 0.26 µs against 1.49 with generated code, those of a query answered by 200 documents 23 µs against 72 |
 | The size of a batch | about 256 KiB: a batch is closed by the document that takes it past that |
-| The form of an address | `syngodbs://host[:port][/database]` with TLS and `syngodb://` without, as SyngoDB Server 6 had them, and `syngodb+unix:///path/to/socket[?database=name]`. `?insecure=true` takes whatever certificate the server shows. An address never carries a user or a password |
+| The form of an address | `syngodbs://host[:port][/database]` with TLS and `syngodb://` without, as SyngoDB Server 6 had them, and `syngodb+unix:///path/to/socket[?database=name]` (on Windows `syngodb+unix:///C:/path/to/socket`). `?insecure=true` takes whatever certificate the server shows. An address never carries a user or a password |
 | The database of a request | named by each request, where the first draft named it once, in `Hello` |

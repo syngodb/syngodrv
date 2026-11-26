@@ -64,11 +64,27 @@ type Reader struct {
 	frame, message int
 	// small counts the messages in a row that would have fitted in keep.
 	small int
-	// midway says the first frames of a message were read and its last one was not.
-	midway bool
+	// midway says the first frames of a message were read and its last one was not, and
+	// announced how long the frame that began it said the whole message is.
+	midway    bool
+	announced uint64
 	// side is the header of a frame that Header is reading, or read part of: sided bytes of it.
 	side  [HeaderSize]byte
 	sided int
+
+	// Announce, when it is set, is called once for every message longer than Over bytes, as
+	// soon as its length is known and before the message itself is read: for a message in one
+	// frame, when the header of the frame is read; for a message in several, when the frame
+	// that announces it is. It is for whoever must have room for a large message before it
+	// takes it: Announce may wait. An error it returns is the error of Next.
+	Announce func(length int) error
+	Over     int
+
+	// Await, when it is set, is called before every read from the connection that Next makes,
+	// with how many bytes of a message that is not whole yet were read so far: none when the
+	// next message has not begun. It is for whoever gives its peer a time to send the rest of
+	// what it began, which is another time than the one to begin.
+	Await func(begun int)
 }
 
 // NewReader returns a reader of src with the limits of a connection that has not logged in.
@@ -90,6 +106,18 @@ func (r *Reader) Buffered() bool { return r.to > r.from }
 // Pending is how many bytes were read from the connection and not handed out yet. Whoever
 // answers one message at a time learns from it what its peer sent before the answer left.
 func (r *Reader) Pending() int { return r.to - r.from }
+
+// Held is how much memory the reader holds on to, and Release gives it back when nothing that
+// was read waits in it: for whoever keeps a reader on a connection that has fallen silent after
+// a large message. A reader that gave its memory back begins again with a little.
+func (r *Reader) Held() int { return cap(r.buf) + cap(r.whole) }
+
+// Release gives back the memory the reader holds, unless something that was read waits in it.
+func (r *Reader) Release() {
+	if r.from == r.to && !r.midway && r.sided == 0 {
+		r.buf, r.from, r.to, r.whole = nil, 0, 0, nil
+	}
+}
 
 // Midway says whether Next failed in the middle of a message that came in several frames. A
 // Next that fails because the connection was told to wait no longer can be called again and
@@ -134,18 +162,33 @@ func (r *Reader) Next() (kind byte, number uint32, payload []byte, err error) {
 	if err != nil {
 		return kind, number, payload, err
 	}
-	if len(payload) > r.message {
-		// A message is held to its limit whether it comes in one frame or in many.
-		return 0, 0, nil, ErrTooLarge
-	}
 	if last {
+		// A message in one frame: it was held to the limit of a message before it was read
+		// (see one).
 		return kind, number, payload, nil
 	}
-	// The message goes on: its frames are put together.
-	if kind == KindCancel || len(payload) == 0 {
+	// The message comes in several frames. The first holds its length and nothing else, and is
+	// no part of the message: the limit of a message is for the length it tells, not for the
+	// frame that tells it.
+	if kind == KindCancel || len(payload) != AnnounceSize {
 		return 0, 0, nil, ErrFrame
 	}
-	r.whole = append(r.whole[:0], payload...)
+	announced := binary.BigEndian.Uint64(payload)
+	r.announced = announced
+	if announced > uint64(r.message) {
+		// Refused before any of it is read.
+		return 0, 0, nil, ErrTooLarge
+	}
+	if announced == 0 {
+		return 0, 0, nil, ErrFrame
+	}
+	if r.Announce != nil && int(announced) > r.Over {
+		if err := r.Announce(int(announced)); err != nil {
+			// With the kind and the number of the message, for whoever answers it all the same.
+			return kind, number, nil, err
+		}
+	}
+	r.whole = r.whole[:0]
 	r.midway = true
 	for !last {
 		var k byte
@@ -161,10 +204,14 @@ func (r *Reader) Next() (kind byte, number uint32, payload []byte, err error) {
 		if k != kind || n != number || (len(payload) == 0 && !last) {
 			return 0, 0, nil, ErrFrame
 		}
-		if len(r.whole)+len(payload) > r.message {
-			return 0, 0, nil, ErrTooLarge
+		if uint64(len(r.whole)+len(payload)) > announced {
+			// More than was announced is no message: its reader made room for what it was told.
+			return 0, 0, nil, ErrFrame
 		}
 		r.whole = append(r.whole, payload...)
+	}
+	if uint64(len(r.whole)) != announced {
+		return 0, 0, nil, ErrFrame
 	}
 	r.midway = false
 	return kind, number, r.whole, nil
@@ -227,6 +274,27 @@ func (r *Reader) one() (kind byte, number uint32, payload []byte, last bool, err
 		}
 		return 0, 0, nil, false, ErrTooLarge
 	}
+	switch {
+	case r.midway && uint64(len(r.whole))+uint64(size) > r.announced:
+		// More than was announced is no message, and is not read to find that out: its reader
+		// made room for what it was told, and for no more.
+		return 0, 0, nil, false, ErrFrame
+	case !last && !r.midway && size != AnnounceSize:
+		// The first frame of a message in several holds its length and nothing else. A frame
+		// of any other size that says it goes on announces nothing, and is not read.
+		return 0, 0, nil, false, ErrFrame
+	}
+	if last && !r.midway {
+		// A message in one frame: its length is known now, and nothing of it need be read yet.
+		if int(size) > r.message {
+			return 0, 0, nil, false, ErrTooLarge
+		}
+		if r.Announce != nil && int(size) > r.Over {
+			if err = r.Announce(int(size)); err != nil {
+				return kind, number, nil, false, err
+			}
+		}
+	}
 	if err = r.fill(HeaderSize + int(size)); err != nil {
 		if err == io.EOF {
 			err = io.ErrUnexpectedEOF
@@ -262,6 +330,15 @@ func (r *Reader) fill(n int) error {
 				r.buf, r.from = grown, 0
 			}
 		}
+		if r.Await != nil {
+			begun := r.to - r.from
+			if r.midway {
+				// The frame that announced the message was read, whatever came of it since: a
+				// message that is announced has begun.
+				begun += AnnounceSize + len(r.whole)
+			}
+			r.Await(begun)
+		}
 		got, err := r.src.Read(r.buf[r.to:])
 		r.to += got
 		if err != nil && r.to-r.from < n {
@@ -281,15 +358,33 @@ func Begin(buf []byte) []byte {
 	return append(buf[:0], 0, 0, 0, 0, 0, 0, 0, 0, 0)
 }
 
+// AnnounceSize is the size of the payload of the frame that announces a message in several
+// frames: the length of the whole message, 8 bytes, big endian.
+const AnnounceSize = 8
+
 // Send writes to dst a message begun with Begin: in one frame and one write when it fits in
 // frame bytes, in several otherwise. It writes over msg while it does, so msg holds nothing of
 // use afterwards. Whoever shares dst with other senders keeps them apart.
+//
+// A message that takes several frames is announced: before them goes a frame that holds
+// nothing but the length of the whole message. Its reader then knows what is coming before it
+// has taken any of it, and can make room, or wait until it has some.
 func Send(dst io.Writer, frame int, kind byte, number uint32, msg []byte) error {
 	if len(msg) < HeaderSize || frame <= 0 {
 		return ErrFrame
 	}
 	// A frame holds MaxFrame at most, whatever is asked: a larger one no reader takes.
 	frame = min(frame, MaxFrame)
+	if whole := len(msg) - HeaderSize; whole > frame {
+		var announce [HeaderSize + AnnounceSize]byte
+		binary.BigEndian.PutUint32(announce[:], AnnounceSize)
+		announce[4] = kind | more
+		binary.BigEndian.PutUint32(announce[5:], number)
+		binary.BigEndian.PutUint64(announce[HeaderSize:], uint64(whole))
+		if _, err := dst.Write(announce[:]); err != nil {
+			return err
+		}
+	}
 	for at := 0; ; {
 		// The header of each frame after the first is written over the end of the frame before
 		// it, which has left already: nothing is copied.
