@@ -53,6 +53,8 @@ type conn struct {
 	waited time.Duration
 	// small counts the requests in a row that took little memory.
 	small int
+	// epoch says which of the client's passwords the connection logged in with.
+	epoch uint64
 }
 
 // keepOut is the most memory a connection holds on to for its requests once they are small
@@ -87,8 +89,10 @@ func (c *Client) dial(ctx context.Context) (*conn, error) {
 	cn := &conn{client: c, nc: nc, in: wire.NewReader(nc), fresh: true}
 	// The documents of an answer are copied before the connection reads anything else.
 	cn.resp.AliasIDs = true
+	user, password, has, epoch := c.login()
+	cn.epoch = epoch
 	hello := wire.Hello{ProtocolMin: protocol, ProtocolMax: protocol, Driver: "syngodrv " + Version, Program: c.cfg.program,
-		HasPassword: c.cfg.hasLogin, User: c.cfg.user, Password: c.cfg.password}
+		HasPassword: has, User: user, Password: password}
 	cn.out = hello.Append(wire.Begin(cn.out))
 	if err := wire.Send(nc, wire.LoginFrame, wire.KindHello, 0, cn.out); err != nil {
 		_ = nc.Close()

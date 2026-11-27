@@ -106,6 +106,15 @@ message Request {
     EnsureDatabase ensure_database = 60;
     DropDatabase drop_database = 61;
     Databases databases = 62;
+
+    PutUser put_user = 70;
+    RemoveUser remove_user = 71;
+    Users users = 72;
+    SetPassword set_password = 73;
+
+    PutIdentity put_identity = 74;
+    RemoveIdentity remove_identity = 75;
+    Identities identities = 76;
   }
 }
 
@@ -386,6 +395,69 @@ message DropDatabase {
 message Databases {}
 
 // ---------------------------------------------------------------------------------------------
+// Users. They are the server's, and not a database's: a user has one role, on every database.
+// A password travels in these requests as it does in Hello, and nowhere else: no answer of the
+// server ever holds one, or what the server keeps of one.
+// ---------------------------------------------------------------------------------------------
+
+// PutUser makes a user, or changes one that is there: the role, the password, or both. It is
+// an administrator's. The server always keeps one administrator: a change that would leave
+// none is refused.
+message PutUser {
+  string name = 1;
+  // ROLE_NONE keeps the role the user has. A new user is given one.
+  Role role = 2;
+  // Empty keeps the password the user has. A new user is given one.
+  string password = 3;
+}
+
+// RemoveUser removes a user. It is an administrator's. The sessions of the user are closed.
+message RemoveUser {
+  string name = 1;
+}
+
+// Users lists the users, in the order of their names, each with its role. It is an
+// administrator's.
+message Users {}
+
+// SetPassword gives the user of the session another password. It is every user's, whatever the
+// role, and asks for the password the user has: a session left open somewhere is not enough to
+// take a user over. A wrong one is answered as a failed login is, after the same delay.
+message SetPassword {
+  string old = 1;
+  string new = 2;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Identities. An identity is a client the server knows by its certificate: a name, a role, and
+// the fingerprint of the certificate's key. A connection that shows a certificate the
+// deployment's authority signed, whose name and fingerprint are an identity's, is that
+// identity, and its Hello carries no password.
+// ---------------------------------------------------------------------------------------------
+
+// PutIdentity makes an identity, or changes one that is there: the role, the fingerprint, or
+// both. It is an administrator's. Another fingerprint is another certificate: what the one
+// before has open is closed.
+message PutIdentity {
+  string name = 1;
+  // ROLE_NONE keeps the role the identity has. A new identity is given one.
+  Role role = 2;
+  // "sha256:" and the 64 hexadecimal digits of the SHA-256 of the key the certificate states.
+  // Empty keeps the fingerprint the identity has. A new identity is given one.
+  string fingerprint = 3;
+}
+
+// RemoveIdentity removes an identity. It is an administrator's. What the identity has open is
+// closed.
+message RemoveIdentity {
+  string name = 1;
+}
+
+// Identities lists the identities, in the order of their names, each with its role and its
+// fingerprint. It is an administrator's. A fingerprint is no secret: it lets nobody in.
+message Identities {}
+
+// ---------------------------------------------------------------------------------------------
 // Responses
 // ---------------------------------------------------------------------------------------------
 
@@ -402,6 +474,8 @@ message Response {
     IndexList indexes = 9;
     NameList names = 10;    // Collections, Databases
     StatsResult stats = 11;
+    UserList users = 12;    // Users
+    IdentityList identities = 13;  // Identities
   }
 }
 
@@ -435,6 +509,27 @@ message Batch {
 
 message IndexList {
   repeated Index indexes = 1;
+}
+
+// UserList is the users of a server. It says who they are and what they may do, and nothing of
+// their passwords.
+message UserList {
+  repeated UserEntry users = 1;
+}
+
+message UserEntry {
+  string name = 1;
+  Role role = 2;
+}
+
+message IdentityList {
+  repeated IdentityEntry identities = 1;
+}
+
+message IdentityEntry {
+  string name = 1;
+  Role role = 2;
+  string fingerprint = 3;
 }
 
 message NameList {
@@ -554,6 +649,9 @@ enum Code {
   UNSUPPORTED = 36;       // a message or a value this server does not know
   PROTOCOL = 37;          // what was received is not a message of the protocol; the server closes
   INTERNAL = 38;          // a fault of the server, which its log says more about
+  NO_USER = 39;           // the name is no user's
+  LAST_ADMIN = 40;        // the change would leave the server without an administrator
+  NO_IDENTITY = 41;       // the name is no identity's
 }
 
 message Duplicate {

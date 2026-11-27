@@ -3,10 +3,12 @@ package syngodrv
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"net"
 	"net/url"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -46,6 +48,13 @@ var (
 	ErrProtocol = errors.New("syngodrv: not the protocol")
 	// ErrServer is returned when the server failed to serve a request; its log says more.
 	ErrServer = errors.New("syngodrv: the server failed")
+	// ErrNoUser is returned for the name of no user of the server.
+	ErrNoUser = errors.New("syngodrv: no user of that name")
+	// ErrLastAdmin is returned for a change that would leave the server without an
+	// administrator.
+	ErrLastAdmin = errors.New("syngodrv: the server would be left without an administrator")
+	// ErrNoIdentity is returned for the name of no identity of the server.
+	ErrNoIdentity = errors.New("syngodrv: no identity of that name")
 )
 
 // ServerError is an error only a server reports: what it said, and which of the errors above it
@@ -80,6 +89,12 @@ func errorOf(e *wire.Error) error {
 		of = ErrUnsupported
 	case wire.CodeProtocol:
 		of = ErrProtocol
+	case wire.CodeNoUser:
+		of = ErrNoUser
+	case wire.CodeLastAdmin:
+		of = ErrLastAdmin
+	case wire.CodeNoIdentity:
+		of = ErrNoIdentity
 	case wire.CodeBusy:
 		// Only a login is answered so for good: the server had no turn left for it.
 		of = ErrConnection
@@ -96,8 +111,11 @@ type config struct {
 	hasLogin       bool
 	tls            *tls.Config
 	unverified     bool
-	pool           int
-	program        string
+	// certFile and keyFile are the certificate the client shows and its key, and authority the
+	// file of the authority the server is checked against: see Certificate and Authority.
+	certFile, keyFile, authority string
+	pool                         int
+	program                      string
 }
 
 // Login is the user and the password the client logs in with. They are given here and never in
@@ -110,6 +128,19 @@ func Login(user, password string) Option {
 // server's certificate is checked against, a certificate of the client's own. Without it the
 // certificate of the server is checked against the authorities of the machine.
 func TLS(rules *tls.Config) Option { return func(c *config) { c.tls = rules } }
+
+// Certificate is the certificate the client shows the server, and its key, in their files in
+// PEM: what "syngod cert client" makes. A server that takes the certificates of clients knows
+// the client by it, and the client then gives no Login: its certificate is who it is.
+func Certificate(certFile, keyFile string) Option {
+	return func(c *config) { c.certFile, c.keyFile = certFile, keyFile }
+}
+
+// Authority is the file, in PEM, of the authority the server's certificate is checked against,
+// and no other: the certificate of the deployment's authority, as "syngod cert ensure" makes
+// it. Without it the certificate of the server is checked against the authorities of the
+// machine, which do not know a deployment's own.
+func Authority(file string) Option { return func(c *config) { c.authority = file } }
 
 // CertificateNotVerified makes the client take whatever certificate the server shows: the
 // connection is encrypted, and nothing says who is at the other end. It is for a server on the
@@ -192,6 +223,14 @@ type Client struct {
 	mu     sync.Mutex
 	idle   []*conn
 	closed bool
+	// epoch counts the passwords the client has logged in with: a connection that came in with
+	// one before the last is not used again (see newPassword).
+	epoch uint64
+	// changing is held, for writing, by the request that gives the client's own user another
+	// password, and for reading by every other request while it is under way: the password
+	// is changed when nothing else of the client is on its way to the server, so that no
+	// request meets a session the server has just ended.
+	changing sync.RWMutex
 	// slots has room for as many connections as the client may keep: whoever wants one takes a
 	// place first, and gives it back with the connection.
 	slots chan struct{}
@@ -259,6 +298,24 @@ func connect(ctx context.Context, where address, options []Option) (*Client, err
 		if c.tls.ServerName == "" {
 			c.tls.ServerName = where.host
 		}
+		if c.cfg.certFile != "" {
+			pair, err := tls.LoadX509KeyPair(c.cfg.certFile, c.cfg.keyFile)
+			if err != nil {
+				return nil, fmt.Errorf("syngodrv: the certificate of the client: %w", err)
+			}
+			c.tls.Certificates = append(c.tls.Certificates, pair)
+		}
+		if c.cfg.authority != "" {
+			text, err := os.ReadFile(c.cfg.authority)
+			if err != nil {
+				return nil, fmt.Errorf("syngodrv: the authority: %w", err)
+			}
+			pool := x509.NewCertPool()
+			if !pool.AppendCertsFromPEM(text) {
+				return nil, fmt.Errorf("syngodrv: the authority: %s holds no certificate in PEM", c.cfg.authority)
+			}
+			c.tls.RootCAs = pool
+		}
 		if c.cfg.unverified || where.insecure {
 			c.tls.InsecureSkipVerify = true
 		}
@@ -290,30 +347,14 @@ func (c *Client) take(ctx context.Context) (*conn, error) {
 			return nil, ctx.Err()
 		}
 	}
-	now := time.Now()
-	for {
-		c.mu.Lock()
-		if c.closed {
-			c.mu.Unlock()
-			<-c.slots
-			return nil, syngo.ErrClosed
-		}
-		n := len(c.idle)
-		if n == 0 {
-			c.mu.Unlock()
-			break
-		}
-		// The connection used last is taken first: it is the one most surely alive.
-		cn := c.idle[n-1]
-		c.idle[n-1] = nil
-		c.idle = c.idle[:n-1]
-		c.mu.Unlock()
-		// One the server may be about to close for its silence is not trusted with a request.
-		if limit := time.Duration(cn.welcome.IdleSeconds) * time.Second; limit > 0 && now.Sub(cn.used) > limit-limit/4 {
-			cn.close()
-			continue
-		}
-		cn.fresh, cn.waited = false, now.Sub(cn.used)
+	c.mu.Lock()
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
+		<-c.slots
+		return nil, syngo.ErrClosed
+	}
+	if cn := c.pooled(time.Now()); cn != nil {
 		return cn, nil
 	}
 	cn, err := c.dial(ctx)
@@ -322,6 +363,33 @@ func (c *Client) take(ctx context.Context) (*conn, error) {
 		return nil, err
 	}
 	return cn, nil
+}
+
+// pooled takes out of the pool a connection that can be used, or returns nil when the pool
+// holds none. The connection used last is taken first: it is the one most surely alive. One
+// the server may be about to close for its silence is not trusted with a request, and one that
+// came in with a password the client has changed since is closed by the server, or about to
+// be: both are closed here, and the next is looked at.
+func (c *Client) pooled(now time.Time) *conn {
+	for {
+		c.mu.Lock()
+		n := len(c.idle)
+		if n == 0 {
+			c.mu.Unlock()
+			return nil
+		}
+		cn := c.idle[n-1]
+		c.idle[n-1] = nil
+		c.idle = c.idle[:n-1]
+		epoch := c.epoch
+		c.mu.Unlock()
+		if limit := time.Duration(cn.welcome.IdleSeconds) * time.Second; cn.epoch != epoch || (limit > 0 && now.Sub(cn.used) > limit-limit/4) {
+			cn.close()
+			continue
+		}
+		cn.fresh, cn.waited = false, now.Sub(cn.used)
+		return cn
+	}
 }
 
 // again makes a new connection in the place of one that failed, which is closed.
@@ -344,7 +412,9 @@ func (c *Client) give(cn *conn) {
 	}
 	cn.used = time.Now()
 	c.mu.Lock()
-	if c.closed {
+	if c.closed || cn.epoch != c.epoch {
+		// The client is closed, or the connection came in with a password the client has
+		// changed since: the server ends such a session.
 		c.mu.Unlock()
 		_ = cn.nc.Close()
 		<-c.slots
@@ -379,6 +449,14 @@ func (c *Client) Database(name string) *DB { return &DB{client: c, name: name} }
 // read. A request that asks for nothing to be changed (safe) is sent again when the connection
 // it was sent on turns out to be dead.
 func (c *Client) call(ctx context.Context, database string, safe bool, fill func(req *wire.Request), read func(resp *wire.Response)) error {
+	// Not while the client changes its own password: see newPassword.
+	c.changing.RLock()
+	defer c.changing.RUnlock()
+	return c.do(ctx, database, safe, fill, read)
+}
+
+// do is call, for whoever holds the client's password still (see changing).
+func (c *Client) do(ctx context.Context, database string, safe bool, fill func(req *wire.Request), read func(resp *wire.Response)) error {
 	cn, err := c.take(ctx)
 	if err != nil {
 		return err

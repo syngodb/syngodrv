@@ -33,6 +33,9 @@ const (
 	CodeUnsupported     uint32 = 36
 	CodeProtocol        uint32 = 37
 	CodeInternal        uint32 = 38
+	CodeNoUser          uint32 = 39
+	CodeLastAdmin       uint32 = 40
+	CodeNoIdentity      uint32 = 41
 )
 
 // The roles of a session.

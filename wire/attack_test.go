@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -656,6 +657,13 @@ func FuzzAttackARequestReadAfterAnother(f *testing.F) {
 		{Database: "data", Op: OpDropIndex, Named: IndexRef{Collection: "things", Name: "by n"}},
 		{Database: "data", Op: OpIndexes, Indexes: "things"},
 		{Op: OpEnsureDatabase, Name: "more"},
+		{Op: OpPutUser, PutUser: PutUser{Name: "ann", Role: 2, Password: "a password"}},
+		{Op: OpRemoveUser, Name: "ann"},
+		{Op: OpUsers},
+		{Op: OpSetPassword, SetPassword: SetPassword{Old: "the old one", New: "the new one"}},
+		{Op: OpPutIdentity, PutIdentity: PutIdentity{Name: "node-1", Role: 2, Fingerprint: "sha256:00"}},
+		{Op: OpRemoveIdentity, Name: "node-1"},
+		{Op: OpIdentities},
 	} {
 		f.Add(req.Append(nil), (&Request{Op: OpPing}).Append(nil))
 		f.Add((&Request{Database: "data", Op: OpQuery, Query: Query{Collection: "c", HasText: true, Text: "x", Args: []Arg{{Name: "a", Values: [][]byte{one}}}, HasOrder: true, Order: []Order{{Field: "f"}}}}).Append(nil), req.Append(nil))
@@ -728,8 +736,14 @@ func attackAsked(m *Request) string {
 		own = m.Named
 	case OpIndexes:
 		own = m.Indexes
-	case OpDropCollection, OpEnsureDatabase, OpDropDatabase:
+	case OpDropCollection, OpEnsureDatabase, OpDropDatabase, OpRemoveUser, OpRemoveIdentity:
 		own = m.Name
+	case OpPutIdentity:
+		own = m.PutIdentity
+	case OpPutUser:
+		own = m.PutUser
+	case OpSetPassword:
+		own = m.SetPassword
 	}
 	return fmt.Sprintf("timeout %d, database %q, op %d: %+v", m.Timeout, m.Database, m.Op, own)
 }
@@ -742,6 +756,8 @@ func FuzzAttackAnAnswerOfAnything(f *testing.F) {
 	f.Add((&Response{Result: ResultDocument, Document: Document{ID: "a", JSON: []byte(`{}`), Revision: 3, Modified: 4, Expires: 5, Meta: []byte(`{}`), Stamp: []byte("s")}}).Append(nil))
 	f.Add((&Response{Result: ResultBatch, Batch: Batch{Documents: []Document{{ID: "a"}, {ID: "b", JSON: []byte(`1`)}}, IDs: []string{"x", "y"}, Cursor: 9, NextPage: "p"}}).Append(nil))
 	f.Add((&Response{Result: ResultStored, Stored: []string{"a", "b"}}).Append(nil))
+	f.Add((&Response{Result: ResultUsers, Users: []User{{Name: "root", Role: 3}, {Name: "reader", Role: 1}}}).Append(nil))
+	f.Add((&Response{Result: ResultIdentities, Identities: []Identity{{Name: "node-1", Role: 3, Fingerprint: "sha256:00"}}}).Append(nil))
 	f.Add((&Response{Result: ResultIndexes, Indexes: []Index{{Name: "n", Fields: []string{"f"}, Unique: true}}}).Append(nil))
 	f.Add((&Response{Result: ResultStats, Stats: Stats{DiskBytes: 5, Collections: []CollectionStats{{Name: "c", Documents: 2, Indexes: []IndexStats{{Index: Index{Name: "n"}}}}}}}).Append(nil))
 	f.Fuzz(func(t *testing.T, message []byte) {
@@ -767,4 +783,119 @@ func FuzzAttackAnAnswerOfAnything(f *testing.F) {
 			}
 		}
 	})
+}
+
+// The requests about users are written and read as what they are, the list of users too. A
+// request that carried a password lets go of it when it is told to, and of nothing else.
+func TestTheRequestsAboutUsers(t *testing.T) {
+	for _, req := range []*Request{
+		{Timeout: 3, Op: OpPutUser, PutUser: PutUser{Name: "ann", Role: 2, Password: "a password"}},
+		{Op: OpPutUser, PutUser: PutUser{Name: "ann", Role: 3}},
+		{Op: OpPutUser, PutUser: PutUser{Name: "ann", Password: "another"}},
+		{Op: OpRemoveUser, Name: "ann"},
+		{Op: OpUsers},
+		{Op: OpSetPassword, SetPassword: SetPassword{Old: "the old one", New: "the new one"}},
+	} {
+		var read Request
+		if !read.Decode(req.Append(nil)) || read.Op != req.Op || read.Timeout != req.Timeout || read.Name != req.Name || read.PutUser != req.PutUser || read.SetPassword != req.SetPassword {
+			t.Errorf("written %+v, read %+v", req, read)
+		}
+		if secret := req.Op == OpPutUser || req.Op == OpSetPassword; read.Secret() != secret {
+			t.Errorf("op %d carries a password: %v", req.Op, read.Secret())
+		}
+		read.Forget()
+		if read.PutUser.Password != "" || read.SetPassword != (SetPassword{}) {
+			t.Errorf("op %d: a password is still held after it was to be forgotten: %+v %+v", req.Op, read.PutUser, read.SetPassword)
+		}
+		if read.PutUser.Name != req.PutUser.Name || read.PutUser.Role != req.PutUser.Role || read.Name != req.Name {
+			t.Errorf("op %d: more than the password was forgotten", req.Op)
+		}
+	}
+	// A request read into the value a request about a user was read into holds none of it.
+	var used Request
+	if !used.Decode((&Request{Op: OpPutUser, PutUser: PutUser{Name: "ann", Role: 2, Password: "a password"}}).Append(nil)) {
+		t.Fatal("a request to make a user is not read")
+	}
+	if !used.Decode((&Request{Op: OpPutUser}).Append(nil)) || used.PutUser != (PutUser{}) {
+		t.Errorf("a request to make a user that says nothing reads as %+v", used.PutUser)
+	}
+	if !used.Decode((&Request{Op: OpSetPassword, SetPassword: SetPassword{Old: "o", New: "n"}}).Append(nil)) || !used.Decode((&Request{Op: OpSetPassword}).Append(nil)) || used.SetPassword != (SetPassword{}) {
+		t.Errorf("a request for a new password that says nothing reads as %+v", used.SetPassword)
+	}
+
+	list := &Response{Result: ResultUsers, Users: []User{{Name: "root", Role: 3}, {Name: "reader", Role: 1}, {Name: "nobody"}}}
+	var read Response
+	if !read.Decode(list.Append(nil)) || read.Result != ResultUsers || len(read.Users) != 3 {
+		t.Fatalf("a list of users reads as %+v", read)
+	}
+	for i, u := range list.Users {
+		if read.Users[i] != u {
+			t.Errorf("user %d written %+v, read %+v", i, u, read.Users[i])
+		}
+	}
+	// An empty list is a list, and the value it is read into holds none of the list before.
+	if !read.Decode((&Response{Result: ResultUsers}).Append(nil)) || read.Result != ResultUsers || len(read.Users) != 0 {
+		t.Errorf("an empty list of users reads as %+v", read)
+	}
+	// A list that describes more than an answer may hold is refused as too large.
+	many := &Response{Result: ResultUsers}
+	for i := 0; i < 1000; i++ {
+		many.Users = append(many.Users, User{Name: "u", Role: 1})
+	}
+	small := Response{Room: 512}
+	if small.Decode(many.Append(nil)) || !small.Over {
+		t.Errorf("a list of a thousand users was read into room for 512 bytes: over %v", small.Over)
+	}
+}
+
+// The requests about identities are written and read as what they are, the list of identities
+// too.
+func TestTheRequestsAboutIdentities(t *testing.T) {
+	print := "sha256:" + strings.Repeat("a", 64)
+	for _, req := range []*Request{
+		{Timeout: 3, Op: OpPutIdentity, PutIdentity: PutIdentity{Name: "node-1", Role: 2, Fingerprint: print}},
+		{Op: OpPutIdentity, PutIdentity: PutIdentity{Name: "node-1", Role: 3}},
+		{Op: OpPutIdentity, PutIdentity: PutIdentity{Name: "node-1", Fingerprint: print}},
+		{Op: OpRemoveIdentity, Name: "node-1"},
+		{Op: OpIdentities},
+	} {
+		var read Request
+		if !read.Decode(req.Append(nil)) || read.Op != req.Op || read.Timeout != req.Timeout || read.Name != req.Name || read.PutIdentity != req.PutIdentity {
+			t.Errorf("written %+v, read %+v", req, read)
+		}
+		// A fingerprint is no secret: nothing of these requests is to be forgotten.
+		if read.Secret() {
+			t.Errorf("op %d is taken to carry a password", req.Op)
+		}
+	}
+	// A request read into the value one about an identity was read into holds none of it.
+	var used Request
+	if !used.Decode((&Request{Op: OpPutIdentity, PutIdentity: PutIdentity{Name: "node-1", Role: 2, Fingerprint: print}}).Append(nil)) {
+		t.Fatal("a request to make an identity is not read")
+	}
+	if !used.Decode((&Request{Op: OpPutIdentity}).Append(nil)) || used.PutIdentity != (PutIdentity{}) {
+		t.Errorf("a request to make an identity that says nothing reads as %+v", used.PutIdentity)
+	}
+
+	list := &Response{Result: ResultIdentities, Identities: []Identity{{Name: "node-1", Role: 3, Fingerprint: print}, {Name: "node-2", Role: 1, Fingerprint: "sha256:" + strings.Repeat("b", 64)}, {Name: "nobody"}}}
+	var read Response
+	if !read.Decode(list.Append(nil)) || read.Result != ResultIdentities || len(read.Identities) != 3 {
+		t.Fatalf("a list of identities reads as %+v", read)
+	}
+	for i, id := range list.Identities {
+		if read.Identities[i] != id {
+			t.Errorf("identity %d written %+v, read %+v", i, id, read.Identities[i])
+		}
+	}
+	if !read.Decode((&Response{Result: ResultIdentities}).Append(nil)) || read.Result != ResultIdentities || len(read.Identities) != 0 {
+		t.Errorf("an empty list of identities reads as %+v", read)
+	}
+	many := &Response{Result: ResultIdentities}
+	for i := 0; i < 1000; i++ {
+		many.Identities = append(many.Identities, Identity{Name: "n", Role: 1, Fingerprint: print})
+	}
+	small := Response{Room: 512}
+	if small.Decode(many.Append(nil)) || !small.Over {
+		t.Errorf("a list of a thousand identities was read into room for 512 bytes: over %v", small.Over)
+	}
 }

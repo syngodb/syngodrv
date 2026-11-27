@@ -193,6 +193,10 @@ func (db *DB) beginOn(ctx context.Context, cn *conn, readOnly, again bool) (*Tx,
 	c := db.client
 	pooled := cn == nil
 	if pooled {
+		// A transaction does not begin on a connection of a password that is being changed:
+		// see Client.changing.
+		c.changing.RLock()
+		defer c.changing.RUnlock()
 		var err error
 		if cn, err = c.take(ctx); err != nil {
 			return nil, err

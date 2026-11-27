@@ -33,7 +33,27 @@ It is our own protocol. The measurements that decided it are in the server's pla
 | Unix socket | optional, without TLS: the file's permissions say who may connect |
 
 A client certificate, when the server accepts or requires one, is shown when the connection is
-made. It is then the identity of the session, and `Hello` carries no password.
+made. It is then the identity of the session, and `Hello` carries no password. The server asks
+one of three things of it, by a setting:
+
+| The server's setting | What a client does |
+| --- | --- |
+| off | shows no certificate (one that is shown is not looked at), and says who it is with a user and a password |
+| accepted | shows a certificate and is the identity it is, or shows none and gives a user and a password |
+| required | shows a certificate: without one the connection ends while it is made |
+
+- **A certificate is checked twice.** While the connection is made: the deployment's authority
+  signed it, it holds today, and it is a client's. Then, at `Hello`: the name it carries and
+  the fingerprint of its key are an identity's (see "Identities" below). A certificate that
+  may sign others is an authority's, the deployment's own included, and never a client's.
+- **A certificate that is shown and is no identity is refused**, `UNAUTHENTICATED`, whatever
+  password comes with it: it is not given a second try. It counts as a failed login of its
+  address.
+- The Unix socket has no TLS and takes a user and a password, whatever is asked of the
+  certificates on TCP.
+- **Where certificates are required, nobody comes as far as a password from another machine.**
+  The login of the web listener then takes a name and a password from the machine itself
+  only, as the socket does.
 
 A TLS connection asks for the protocol by its name, `syngo` (ALPN). A client of anything else,
 the driver of SyngoDB Server 6 among them, is refused while the connection is made, and never
@@ -81,16 +101,27 @@ Everything travels in frames. A frame is a header of 9 bytes and a payload:
 3. Requests and answers follow, one at a time.
 
 - **The role is read at every request**, a `Commit` included. A user whose role changes loses
-  what they lost at once, on sessions that are already open. A user who is removed loses the
-  session: its next request, whatever it is, is answered `UNAUTHENTICATED`, the session is
-  closed, and a transaction it had open is given up.
+  what they lost at once, on sessions that are already open.
+- **A session ends with what it came in with.** One that came in with a password is that
+  user's for as long as the password is: when the user is given another, or is removed, the
+  session is nobody's. So is one that came in with a certificate, when its identity is given
+  another or is removed. The server closes such a session at once when it waits for a
+  request. One that is being served a request is answered first, and closed then: the answer
+  is `UNAUTHENTICATED` unless the request was already done. A transaction it had open is given
+  up.
 - **Keep alive.** A session silent for longer than `Welcome` says is closed. `Ping` is a
   request like any other, and is how a pool keeps an idle connection and learns that one died.
   A `CANCEL` frame is not the session speaking, and does not count.
 - **A failed login** is answered after a delay that grows, never by locking anyone out. The
-  delay is counted for the address the logins come from: 100 ms after one failure, twice as
-  long after each more, 5 seconds at most, and forgotten a minute after the last. A right
-  password is always let in, after the wait.
+  delay is counted for the address the logins come from (for an address of IPv6, its network
+  of 64 bits): 100 ms after one failure, twice as long after each more, 5 seconds at most, and
+  forgotten a minute after the last.
+- **The logins of such an address wait one after the other**, each one delay after the one
+  before: an address has one password checked every delay, however many connections it
+  opens. A login whose turn lies further ahead than a connection has to say who it is, is
+  answered `BUSY` at once.
+- **A password that was right a moment ago waits for none of this**: the connections of a
+  program that is logged in are not held up by whoever guesses from the same address.
 - **Passwords are checked a few at a time.** A login that could not be looked at within the
   time a connection has to say who it is (10 seconds) is answered `BUSY`.
 - **An answer must be taken.** A client that takes no part of an answer for 30 seconds loses
@@ -114,12 +145,56 @@ Everything travels in frames. A frame is a header of 9 bytes and a payload:
 | `EnsureIndex`, `RebuildIndex`, `DropIndex`, `Indexes` | done, the list | the same |
 | `Collections`, `DropCollection`, `Stats` | the list, done, the figures | the same |
 | `EnsureDatabase`, `DropDatabase`, `Databases` | done, the list | none: an embedded database is a directory |
+| `PutUser`, `RemoveUser`, `Users`, `SetPassword` | done, the list | none: an embedded database has no users |
+| `PutIdentity`, `RemoveIdentity`, `Identities` | done, the list | none |
 
-Every request but the last three names its database. **A database is made on purpose**, with
-`EnsureDatabase`: one that is only named is answered `NO_DATABASE`.
+Every request but those of the last three rows names its database. **A database is made on
+purpose**, with `EnsureDatabase`: one that is only named is answered `NO_DATABASE`.
 
-What else belongs to the server as a whole (users and identities, backup and restore) comes with
-the phases that build it, as more requests of the same shape.
+What else belongs to the server as a whole (backup and restore) comes with the phases that
+build it, as more requests of the same shape.
+
+**Users** are the server's, and not a database's: a user has one role, on every database.
+
+- `PutUser`, `RemoveUser` and `Users` are an administrator's. `PutUser` makes a user or changes
+  one: a role that is not stated keeps the role, an empty password keeps the password, and a
+  new user is given both. Names are told apart without regard to case.
+- **One administrator always remains**: a change that would leave none is answered
+  `LAST_ADMIN`. The name of no user is answered `NO_USER`.
+- **What a removed user has open is closed at once, and so is what came in with a password
+  the user no longer has.** A role that changes alone closes nothing, and holds from the next
+  request of every session.
+- `SetPassword` is every user's, for the user of the session, and asks for the password the
+  user has. A wrong one is a failed login: counted, answered `UNAUTHENTICATED` after the same
+  delay, and the session goes on.
+- **Whoever changes their own password stays**: the session that asked, by `SetPassword` or
+  by a `PutUser` of its own user, is of the new password. Every other session of the user
+  ends. A driver logs in with the new password from then on, and lets go of the connections
+  it made with the old one.
+- **A password travels in these requests as it does in `Hello`, and nowhere else.** No answer
+  holds one, or what the server keeps of one: `Users` lists names and roles. A password is 1
+  to 72 bytes, none of them zero. A name is 1 to 255 bytes of valid UTF-8 without a control
+  character.
+
+**Identities** are clients the server knows by their certificates: a name, a role, and the
+fingerprint of the certificate's key. They are a kind of their own beside the users: a user and
+an identity may carry one name.
+
+- `PutIdentity`, `RemoveIdentity` and `Identities` are an administrator's. `PutIdentity` makes
+  an identity or changes one: a role that is not stated keeps the role, an empty fingerprint
+  keeps the fingerprint, and a new identity is given both. The name of no identity is
+  answered `NO_IDENTITY`.
+- **The fingerprint** is `sha256:` and the 64 hexadecimal digits of the SHA-256 of the key the
+  certificate states (its `SubjectPublicKeyInfo`). It says which certificate, and lets nobody
+  in: `Identities` lists it.
+- **Another fingerprint is another certificate.** What the one before has open is closed at
+  once, and it is nobody from then on, with no list of revoked certificates and whatever its
+  dates say. The same holds for an identity that is removed.
+- **One administrator always remains**, users and identities counted together where the
+  server looks at certificates. Where it looks at none, an identity is somebody nobody can
+  be: it is not counted, and the last user who is an administrator stays.
+- A session that came in with a certificate has no password: `SetPassword` is answered
+  `FORBIDDEN`.
 
 **What a request may be.** Each bound is a setting of the server with a default, and a request
 beyond one is answered `TOO_LARGE`, with nothing done and the session kept:
@@ -141,9 +216,14 @@ the server, and a client needs to know only what it is told:
 
 - **Room.** The server has a budget of memory for the requests it serves at once. A message
   longer than 64 KiB waits for room before the server reads it, and again before it is served;
-  an answer waits before it is made. The client sees a request that takes longer. A request
-  that finds no room for as long as a session may stay silent is answered `BUSY`, with nothing
-  done: it is sent again later.
+  an answer waits before it is made. **A request that reads documents of a collection that
+  holds large ones waits for room before it reads**: the size of a document is not known
+  before it is read, so room is made for the largest the collection ever held. A request that
+  rewrites a document it did not send (`Patch`, `Modify`) is counted as a write of that size.
+  Nothing is asked for the documents of a collection of small ones, however many requests
+  come at once; an answer larger than 64 KiB waits for its own room, whatever it is made of.
+  The client sees a request that takes longer. A request that finds no room for as long as a
+  session may stay silent is answered `BUSY`, with nothing done: it is sent again later.
 - **A rate.** A user who makes more requests a second than it may is answered `BUSY` with the
   time to wait, and nothing is done. This driver waits that long and sends the request again.
 - **A full server** answers the hello with `BUSY` and closes the connection.
@@ -236,7 +316,7 @@ document for `DUPLICATE`, where in the text for `INVALID_QUERY`).
 | Code | The driver returns |
 | --- | --- |
 | `NOT_FOUND` to `CORRUPT` | the error of the public package with that name (`syngo.ErrNotFound`, `*syngo.DuplicateError`, ...) |
-| `UNAUTHENTICATED`, `FORBIDDEN`, `NO_DATABASE` | errors of the driver |
+| `UNAUTHENTICATED`, `FORBIDDEN`, `NO_DATABASE`, `NO_USER`, `NO_IDENTITY`, `LAST_ADMIN` | errors of the driver |
 | `STALE` | the driver's concern for a stamp; for a cursor, a token or a transaction, an error of the driver that says what was lost |
 | `BUSY` | nothing: the driver waits as long as the answer says, and sends again |
 | `CANCELLED` | the error of the program's context |

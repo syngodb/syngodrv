@@ -216,6 +216,9 @@ func (q *Query) open(ctx context.Context, ids bool) (p *pulled, docs []*syngo.Do
 		p.cn = tx.cn
 	} else {
 		client := q.c.db.client
+		// Nor does an answer: see Client.changing.
+		client.changing.RLock()
+		defer client.changing.RUnlock()
 		if p.cn, err = client.take(ctx); err != nil {
 			return nil, nil, nil, err
 		}

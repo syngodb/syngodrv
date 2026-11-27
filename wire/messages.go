@@ -46,7 +46,26 @@ const (
 	OpEnsureDatabase Op = 60
 	OpDropDatabase   Op = 61
 	OpDatabases      Op = 62
+
+	OpPutUser     Op = 70
+	OpRemoveUser  Op = 71
+	OpUsers       Op = 72
+	OpSetPassword Op = 73
+
+	OpPutIdentity    Op = 74
+	OpRemoveIdentity Op = 75
+	OpIdentities     Op = 76
 )
+
+// Ops is every request there is, in the order of their numbers. Whoever must have something
+// for each of them (a server its answer, a table of who may ask what its row) goes through
+// this list, and a test of this package holds the list to the constants above.
+func Ops() []Op {
+	return []Op{OpPing, OpGet, OpExists, OpCount, OpPut, OpPutBatch, OpPatch, OpModify, OpDelete, OpQuery, OpNext, OpCloseCursor,
+		OpBegin, OpCommit, OpRollback, OpEnsureIndex, OpRebuildIndex, OpDropIndex, OpIndexes, OpCollections, OpDropCollection, OpStats,
+		OpEnsureDatabase, OpDropDatabase, OpDatabases, OpPutUser, OpRemoveUser, OpUsers, OpSetPassword,
+		OpPutIdentity, OpRemoveIdentity, OpIdentities}
+}
 
 // Request is one request of a session. Op says which, and the field of that name holds it.
 type Request struct {
@@ -85,9 +104,44 @@ type Request struct {
 	Named IndexRef
 	// Indexes is the collection of Indexes.
 	Indexes string
-	// Name is the name of DropCollection, EnsureDatabase and DropDatabase.
-	Name string
+	// Name is the name of DropCollection, EnsureDatabase, DropDatabase, RemoveUser and
+	// RemoveIdentity.
+	Name        string
+	PutUser     PutUser
+	SetPassword SetPassword
+	PutIdentity PutIdentity
 }
+
+// PutIdentity makes an identity or changes one. A role of zero keeps the role the identity
+// has, and an empty fingerprint the fingerprint.
+type PutIdentity struct {
+	Name        string
+	Role        uint8
+	Fingerprint string
+}
+
+// PutUser makes a user or changes one. A role of zero keeps the role the user has, and an empty
+// password the password.
+type PutUser struct {
+	Name     string
+	Role     uint8
+	Password string
+}
+
+// SetPassword gives the user of the session another password, for the one the user has.
+type SetPassword struct {
+	Old, New string
+}
+
+// Forget lets go of what a request holds that is a secret, once the request was served: the
+// passwords of PutUser and SetPassword. Whoever read the request from a connection wipes the
+// message they lay in as well.
+func (m *Request) Forget() {
+	m.PutUser.Password, m.SetPassword = "", SetPassword{}
+}
+
+// Secret says whether the request carries a password.
+func (m *Request) Secret() bool { return m.Op == OpPutUser || m.Op == OpSetPassword }
 
 type Get struct {
 	Collection string
@@ -300,8 +354,19 @@ func (m *Request) Append(b []byte) []byte {
 		b = putString(b, 2, m.Named.Name)
 	case OpIndexes:
 		b = putString(b, 1, m.Indexes)
-	case OpDropCollection, OpEnsureDatabase, OpDropDatabase:
+	case OpDropCollection, OpEnsureDatabase, OpDropDatabase, OpRemoveUser, OpRemoveIdentity:
 		b = putString(b, 1, m.Name)
+	case OpPutIdentity:
+		b = putString(b, 1, m.PutIdentity.Name)
+		b = putUint(b, 2, uint64(m.PutIdentity.Role))
+		b = putString(b, 3, m.PutIdentity.Fingerprint)
+	case OpPutUser:
+		b = putString(b, 1, m.PutUser.Name)
+		b = putUint(b, 2, uint64(m.PutUser.Role))
+		b = putString(b, 3, m.PutUser.Password)
+	case OpSetPassword:
+		b = putString(b, 1, m.SetPassword.Old)
+		b = putString(b, 2, m.SetPassword.New)
 	}
 	return shut(b, at)
 }
@@ -331,8 +396,26 @@ func (m *Request) Decode(b []byte) bool {
 			body, _ := d.inner(how)
 			m.Op = Op(field)
 			switch m.Op {
-			case OpPing, OpCommit, OpRollback, OpCollections, OpStats, OpDatabases:
+			case OpPing, OpCommit, OpRollback, OpCollections, OpStats, OpDatabases, OpUsers, OpIdentities:
 				body.rest()
+			case OpPutIdentity:
+				m.PutIdentity = PutIdentity{}
+				for {
+					f, h, ok := body.next()
+					if !ok {
+						break
+					}
+					switch f {
+					case 1:
+						m.PutIdentity.Name = body.text(h)
+					case 2:
+						m.PutIdentity.Role = body.small(h)
+					case 3:
+						m.PutIdentity.Fingerprint = body.text(h)
+					default:
+						body.skip(h)
+					}
+				}
 			case OpGet:
 				m.Get = Get{}
 				for {
@@ -465,7 +548,41 @@ func (m *Request) Decode(b []byte) bool {
 						body.skip(h)
 					}
 				}
-			case OpIndexes, OpDropCollection, OpEnsureDatabase, OpDropDatabase:
+			case OpPutUser:
+				m.PutUser = PutUser{}
+				for {
+					f, h, ok := body.next()
+					if !ok {
+						break
+					}
+					switch f {
+					case 1:
+						m.PutUser.Name = body.text(h)
+					case 2:
+						m.PutUser.Role = body.small(h)
+					case 3:
+						m.PutUser.Password = body.text(h)
+					default:
+						body.skip(h)
+					}
+				}
+			case OpSetPassword:
+				m.SetPassword = SetPassword{}
+				for {
+					f, h, ok := body.next()
+					if !ok {
+						break
+					}
+					switch f {
+					case 1:
+						m.SetPassword.Old = body.text(h)
+					case 2:
+						m.SetPassword.New = body.text(h)
+					default:
+						body.skip(h)
+					}
+				}
+			case OpIndexes, OpDropCollection, OpEnsureDatabase, OpDropDatabase, OpRemoveUser, OpRemoveIdentity:
 				// One text in field 1, which Indexes keeps apart from the others.
 				var text string
 				for {
@@ -1025,17 +1142,19 @@ func (m *Index) decode(d *decoder) {
 type Result uint8
 
 const (
-	ResultError    Result = 1
-	ResultDone     Result = 2
-	ResultDocument Result = 3
-	ResultFound    Result = 4
-	ResultNumber   Result = 5
-	ResultStored   Result = 6
-	ResultBatch    Result = 7
-	ResultText     Result = 8
-	ResultIndexes  Result = 9
-	ResultNames    Result = 10
-	ResultStats    Result = 11
+	ResultError      Result = 1
+	ResultDone       Result = 2
+	ResultDocument   Result = 3
+	ResultFound      Result = 4
+	ResultNumber     Result = 5
+	ResultStored     Result = 6
+	ResultBatch      Result = 7
+	ResultText       Result = 8
+	ResultIndexes    Result = 9
+	ResultNames      Result = 10
+	ResultStats      Result = 11
+	ResultUsers      Result = 12
+	ResultIdentities Result = 13
 )
 
 // Response is the answer to one request. Result says which, and the field of that name holds it.
@@ -1064,6 +1183,24 @@ type Response struct {
 	// Names holds the names of ResultNames.
 	Names []string
 	Stats Stats
+	// Users holds the users of ResultUsers.
+	Users []User
+	// Identities holds the identities of ResultIdentities.
+	Identities []Identity
+}
+
+// Identity is an identity of the server as a list of them shows one: who, what it may do, and
+// the fingerprint of the key of its certificate.
+type Identity struct {
+	Name        string
+	Role        uint8
+	Fingerprint string
+}
+
+// User is a user of the server as a list of them shows one: who, and what the user may do.
+type User struct {
+	Name string
+	Role uint8
 }
 
 // Document is a document with what the database keeps beside it.
@@ -1719,6 +1856,29 @@ func (m *Response) Append(b []byte) []byte {
 		var at int
 		b, at = open(b, 11)
 		return shut(m.Stats.append(b), at)
+	case ResultUsers:
+		var at int
+		b, at = open(b, 12)
+		for i := range m.Users {
+			var one int
+			b, one = open(b, 1)
+			b = putString(b, 1, m.Users[i].Name)
+			b = putUint(b, 2, uint64(m.Users[i].Role))
+			b = shut(b, one)
+		}
+		return shut(b, at)
+	case ResultIdentities:
+		var at int
+		b, at = open(b, 13)
+		for i := range m.Identities {
+			var one int
+			b, one = open(b, 1)
+			b = putString(b, 1, m.Identities[i].Name)
+			b = putUint(b, 2, uint64(m.Identities[i].Role))
+			b = putString(b, 3, m.Identities[i].Fingerprint)
+			b = shut(b, one)
+		}
+		return shut(b, at)
 	case ResultBatch:
 		// And so is a batch.
 		size := m.Batch.size()
@@ -1946,6 +2106,90 @@ func (m *Response) Decode(b []byte) bool {
 			}
 			m.Result = ResultStats
 			m.Stats.decode(&body)
+			d.bad = d.bad || body.bad
+		case ResultUsers:
+			body, ok := d.inner(how)
+			if !ok {
+				continue
+			}
+			m.Result, m.Users = ResultUsers, m.Users[:0]
+			for {
+				f, h, ok := body.next()
+				if !ok {
+					break
+				}
+				if f != 1 {
+					body.skip(h)
+					continue
+				}
+				one, ok := body.inner(h)
+				if !ok {
+					continue
+				}
+				if !body.take(unsafe.Sizeof(User{})) {
+					continue
+				}
+				var u User
+				for {
+					f, h, ok := one.next()
+					if !ok {
+						break
+					}
+					switch f {
+					case 1:
+						u.Name = one.text(h)
+					case 2:
+						u.Role = one.small(h)
+					default:
+						one.skip(h)
+					}
+				}
+				m.Users = append(m.Users, u)
+				body.bad = body.bad || one.bad
+			}
+			d.bad = d.bad || body.bad
+		case ResultIdentities:
+			body, ok := d.inner(how)
+			if !ok {
+				continue
+			}
+			m.Result, m.Identities = ResultIdentities, m.Identities[:0]
+			for {
+				f, h, ok := body.next()
+				if !ok {
+					break
+				}
+				if f != 1 {
+					body.skip(h)
+					continue
+				}
+				one, ok := body.inner(h)
+				if !ok {
+					continue
+				}
+				if !body.take(unsafe.Sizeof(Identity{})) {
+					continue
+				}
+				var i Identity
+				for {
+					f, h, ok := one.next()
+					if !ok {
+						break
+					}
+					switch f {
+					case 1:
+						i.Name = one.text(h)
+					case 2:
+						i.Role = one.small(h)
+					case 3:
+						i.Fingerprint = one.text(h)
+					default:
+						one.skip(h)
+					}
+				}
+				m.Identities = append(m.Identities, i)
+				body.bad = body.bad || one.bad
+			}
 			d.bad = d.bad || body.bad
 		default:
 			d.skip(how)
