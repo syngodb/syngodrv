@@ -95,6 +95,14 @@ func errorOf(e *wire.Error) error {
 		of = ErrLastAdmin
 	case wire.CodeNoIdentity:
 		of = ErrNoIdentity
+	case wire.CodeNoKept:
+		of = ErrNoKept
+	case wire.CodeNoSpace:
+		of = ErrNoSpace
+	case wire.CodeBackup:
+		of = ErrBackup
+	case wire.CodePassphrase:
+		of = ErrPassphrase
 	case wire.CodeBusy:
 		// Only a login is answered so for good: the server had no turn left for it.
 		of = ErrConnection

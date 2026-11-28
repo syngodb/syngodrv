@@ -36,6 +36,10 @@ const (
 	CodeNoUser          uint32 = 39
 	CodeLastAdmin       uint32 = 40
 	CodeNoIdentity      uint32 = 41
+	CodeNoKept          uint32 = 42
+	CodeNoSpace         uint32 = 43
+	CodeBackup          uint32 = 44
+	CodePassphrase      uint32 = 45
 )
 
 // The roles of a session.

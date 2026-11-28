@@ -115,6 +115,19 @@ message Request {
     PutIdentity put_identity = 74;
     RemoveIdentity remove_identity = 75;
     Identities identities = 76;
+
+    // A database as a stream, and what looks after it.
+    Backup backup = 80;
+    Export export = 81;
+    Restore restore = 82;
+    Import import = 83;
+    Part part = 84;
+    End end = 85;
+    Compact compact = 86;
+    Measure measure = 87;
+    Kept kept = 88;
+    BringBack bring_back = 89;
+    Discard discard = 90;
   }
 }
 
@@ -392,7 +405,11 @@ message DropDatabase {
 }
 
 // Databases lists the names of the databases, in order.
-message Databases {}
+message Databases {
+  // With it the answer is a DatabaseList, each database with what it takes on disk and since
+  // when it is.
+  bool details = 1;
+}
 
 // ---------------------------------------------------------------------------------------------
 // Users. They are the server's, and not a database's: a user has one role, on every database.
@@ -458,6 +475,78 @@ message RemoveIdentity {
 message Identities {}
 
 // ---------------------------------------------------------------------------------------------
+// A database as a stream, and what looks after it. Backup and Export answer with a stream the
+// client pulls; Restore and Import begin an upload that Part and End carry on.
+// ---------------------------------------------------------------------------------------------
+
+// Backup answers with the database as a stream of bytes that Restore reads back: the database
+// as it was when the request came, whatever is written meanwhile. The answer is pulled like
+// that of a query, a part at a time, with Next. It is a reader's.
+message Backup {}
+
+// Export answers with the database as lines of JSON, pulled the same way. It is a reader's.
+message Export {}
+
+// Restore begins the upload of a backup. The parts follow with Part, and End makes the backup
+// the database of that name, in one step: a database that was there under the name is replaced,
+// and kept for a time, for an undo. It is an administrator's. A session has one upload at a
+// time, and an upload that is sent nothing for as long as a transaction may stay idle is given
+// up.
+message Restore {
+  string name = 1;
+  // The passphrase the backup was made under, when it is not the server's own.
+  string passphrase = 2;
+}
+
+// Import begins the upload of an export. Without replace its lines are added to the database
+// of that name as it is, which a writer may ask. With replace they become the database of that
+// name, all or nothing, as a restore does, which is an administrator's.
+message Import {
+  string name = 1;
+  bool replace = 2;
+  // Lines that are refused are passed over and listed in the report, where the import would
+  // otherwise stop at the first.
+  bool skip_refused = 3;
+}
+
+// Part sends the next bytes of the upload of the session. It is answered once the server has
+// taken them.
+message Part {
+  bytes data = 1;
+}
+
+// End ends the upload of the session: what was sent becomes what it was sent for, or, with
+// abandon, is given up. An import answers with its report.
+message End {
+  bool abandon = 1;
+}
+
+// Compact has the database give back the room of what was removed or replaced. It is an
+// administrator's.
+message Compact {}
+
+// Measure sets right the bound of the largest document of a collection, which only ever rises
+// otherwise, and answers with it. It is an administrator's.
+message Measure {
+  string collection = 1;
+}
+
+// Kept lists the directories that were databases until the databases were replaced, and are
+// kept for an undo. It is an administrator's.
+message Kept {}
+
+// BringBack gives the name of a kept directory back to it: the database is again what it was.
+// What the name stands for at that moment is kept in its turn. It is an administrator's.
+message BringBack {
+  uint64 id = 1;
+}
+
+// Discard removes a kept directory now. It is an administrator's.
+message Discard {
+  uint64 id = 1;
+}
+
+// ---------------------------------------------------------------------------------------------
 // Responses
 // ---------------------------------------------------------------------------------------------
 
@@ -476,6 +565,10 @@ message Response {
     StatsResult stats = 11;
     UserList users = 12;    // Users
     IdentityList identities = 13;  // Identities
+    Stream stream = 14;            // Backup, Export, Next
+    Report report = 15;            // End, of an import
+    KeptList kept = 16;            // Kept
+    DatabaseList databases = 17;   // Databases, with details
   }
 }
 
@@ -530,6 +623,53 @@ message IdentityEntry {
   string name = 1;
   Role role = 2;
   string fingerprint = 3;
+}
+
+// A part of a stream of bytes. When cursor is not zero the stream goes on.
+message Stream {
+  bytes data = 1;
+  uint64 cursor = 2;
+}
+
+// What an import did.
+message Report {
+  int64 lines = 1;
+  int64 documents = 2;
+  uint32 indexes = 3;
+  int64 refused = 4;
+  // The lines that were refused and passed over, the first thousand of them.
+  repeated Refusal refusals = 5;
+  // The line the import stopped at, when it stopped at one it refused.
+  Refusal stopped = 6;
+}
+
+message Refusal {
+  int64 line = 1;
+  Error error = 2;
+}
+
+message KeptList {
+  repeated KeptEntry kept = 1;
+}
+
+// The times are nanoseconds since 1970.
+message KeptEntry {
+  uint64 id = 1;
+  string name = 2;
+  sfixed64 created = 3;
+  sfixed64 at = 4;
+  sfixed64 until = 5;
+  int64 bytes = 6;
+}
+
+message DatabaseList {
+  repeated DatabaseEntry databases = 1;
+}
+
+message DatabaseEntry {
+  string name = 1;
+  sfixed64 created = 2;
+  int64 bytes = 3;
 }
 
 message NameList {
@@ -652,6 +792,10 @@ enum Code {
   NO_USER = 39;           // the name is no user's
   LAST_ADMIN = 40;        // the change would leave the server without an administrator
   NO_IDENTITY = 41;       // the name is no identity's
+  NO_KEPT = 42;           // there is no kept directory of that number
+  NO_SPACE = 43;          // there is not room enough for what was asked
+  BACKUP = 44;            // what was sent is not a backup, or could not be read as one
+  PASSPHRASE = 45;        // the passphrase of the backup is wrong or missing
 }
 
 message Duplicate {

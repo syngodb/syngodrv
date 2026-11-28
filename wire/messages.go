@@ -55,6 +55,18 @@ const (
 	OpPutIdentity    Op = 74
 	OpRemoveIdentity Op = 75
 	OpIdentities     Op = 76
+
+	OpBackup    Op = 80
+	OpExport    Op = 81
+	OpRestore   Op = 82
+	OpImport    Op = 83
+	OpPart      Op = 84
+	OpEnd       Op = 85
+	OpCompact   Op = 86
+	OpMeasure   Op = 87
+	OpKept      Op = 88
+	OpBringBack Op = 89
+	OpDiscard   Op = 90
 )
 
 // Ops is every request there is, in the order of their numbers. Whoever must have something
@@ -64,7 +76,8 @@ func Ops() []Op {
 	return []Op{OpPing, OpGet, OpExists, OpCount, OpPut, OpPutBatch, OpPatch, OpModify, OpDelete, OpQuery, OpNext, OpCloseCursor,
 		OpBegin, OpCommit, OpRollback, OpEnsureIndex, OpRebuildIndex, OpDropIndex, OpIndexes, OpCollections, OpDropCollection, OpStats,
 		OpEnsureDatabase, OpDropDatabase, OpDatabases, OpPutUser, OpRemoveUser, OpUsers, OpSetPassword,
-		OpPutIdentity, OpRemoveIdentity, OpIdentities}
+		OpPutIdentity, OpRemoveIdentity, OpIdentities,
+		OpBackup, OpExport, OpRestore, OpImport, OpPart, OpEnd, OpCompact, OpMeasure, OpKept, OpBringBack, OpDiscard}
 }
 
 // Request is one request of a session. Op says which, and the field of that name holds it.
@@ -110,6 +123,35 @@ type Request struct {
 	PutUser     PutUser
 	SetPassword SetPassword
 	PutIdentity PutIdentity
+	// Restore and Import begin an upload, which Part then sends and End ends.
+	Restore Restore
+	Import  Import
+	// Part is the data of OpPart. It lies in the message it was decoded from.
+	Part []byte
+	// Abandon is of OpEnd: what was sent is given up.
+	Abandon bool
+	// Measure is the collection of OpMeasure.
+	Measure string
+	// KeptID is the kept directory of OpBringBack and OpDiscard.
+	KeptID uint64
+	// Details is of OpDatabases: each database with what it takes and since when it is.
+	Details bool
+}
+
+// Restore begins the upload of a backup, which becomes the database of that name. Passphrase
+// is the one the backup was made under, when that is not the server's own.
+type Restore struct {
+	Name       string
+	Passphrase string
+}
+
+// Import begins the upload of an export. Without Replace its lines are added to the database
+// of that name as it is; with it they become the database of that name, in the place of what
+// it was. SkipRefused passes over the lines that are refused.
+type Import struct {
+	Name        string
+	Replace     bool
+	SkipRefused bool
 }
 
 // PutIdentity makes an identity or changes one. A role of zero keeps the role the identity
@@ -134,14 +176,16 @@ type SetPassword struct {
 }
 
 // Forget lets go of what a request holds that is a secret, once the request was served: the
-// passwords of PutUser and SetPassword. Whoever read the request from a connection wipes the
-// message they lay in as well.
+// passwords of PutUser and SetPassword, and the passphrase of Restore. Whoever read the request
+// from a connection wipes the message they lay in as well.
 func (m *Request) Forget() {
-	m.PutUser.Password, m.SetPassword = "", SetPassword{}
+	m.PutUser.Password, m.SetPassword, m.Restore.Passphrase = "", SetPassword{}, ""
 }
 
-// Secret says whether the request carries a password.
-func (m *Request) Secret() bool { return m.Op == OpPutUser || m.Op == OpSetPassword }
+// Secret says whether the request carries a password or a passphrase.
+func (m *Request) Secret() bool {
+	return m.Op == OpPutUser || m.Op == OpSetPassword || m.Op == OpRestore
+}
 
 type Get struct {
 	Collection string
@@ -356,6 +400,23 @@ func (m *Request) Append(b []byte) []byte {
 		b = putString(b, 1, m.Indexes)
 	case OpDropCollection, OpEnsureDatabase, OpDropDatabase, OpRemoveUser, OpRemoveIdentity:
 		b = putString(b, 1, m.Name)
+	case OpDatabases:
+		b = putBool(b, 1, m.Details)
+	case OpRestore:
+		b = putString(b, 1, m.Restore.Name)
+		b = putString(b, 2, m.Restore.Passphrase)
+	case OpImport:
+		b = putString(b, 1, m.Import.Name)
+		b = putBool(b, 2, m.Import.Replace)
+		b = putBool(b, 3, m.Import.SkipRefused)
+	case OpPart:
+		b = putBytes(b, 1, m.Part)
+	case OpEnd:
+		b = putBool(b, 1, m.Abandon)
+	case OpMeasure:
+		b = putString(b, 1, m.Measure)
+	case OpBringBack, OpDiscard:
+		b = putUint(b, 1, m.KeptID)
 	case OpPutIdentity:
 		b = putString(b, 1, m.PutIdentity.Name)
 		b = putUint(b, 2, uint64(m.PutIdentity.Role))
@@ -396,8 +457,23 @@ func (m *Request) Decode(b []byte) bool {
 			body, _ := d.inner(how)
 			m.Op = Op(field)
 			switch m.Op {
-			case OpPing, OpCommit, OpRollback, OpCollections, OpStats, OpDatabases, OpUsers, OpIdentities:
+			case OpPing, OpCommit, OpRollback, OpCollections, OpStats, OpUsers, OpIdentities,
+				OpBackup, OpExport, OpCompact, OpKept:
 				body.rest()
+			case OpDatabases:
+				m.Details = false
+				for {
+					f, h, ok := body.next()
+					if !ok {
+						break
+					}
+					switch f {
+					case 1:
+						m.Details = body.bool(h)
+					default:
+						body.skip(h)
+					}
+				}
 			case OpPutIdentity:
 				m.PutIdentity = PutIdentity{}
 				for {
@@ -601,6 +677,96 @@ func (m *Request) Decode(b []byte) bool {
 					m.Indexes = text
 				} else {
 					m.Name = text
+				}
+			case OpRestore:
+				m.Restore = Restore{}
+				for {
+					f, h, ok := body.next()
+					if !ok {
+						break
+					}
+					switch f {
+					case 1:
+						m.Restore.Name = body.text(h)
+					case 2:
+						m.Restore.Passphrase = body.text(h)
+					default:
+						body.skip(h)
+					}
+				}
+			case OpImport:
+				m.Import = Import{}
+				for {
+					f, h, ok := body.next()
+					if !ok {
+						break
+					}
+					switch f {
+					case 1:
+						m.Import.Name = body.text(h)
+					case 2:
+						m.Import.Replace = body.bool(h)
+					case 3:
+						m.Import.SkipRefused = body.bool(h)
+					default:
+						body.skip(h)
+					}
+				}
+			case OpPart:
+				m.Part = nil
+				for {
+					f, h, ok := body.next()
+					if !ok {
+						break
+					}
+					switch f {
+					case 1:
+						m.Part = body.bytes(h)
+					default:
+						body.skip(h)
+					}
+				}
+			case OpEnd:
+				m.Abandon = false
+				for {
+					f, h, ok := body.next()
+					if !ok {
+						break
+					}
+					switch f {
+					case 1:
+						m.Abandon = body.bool(h)
+					default:
+						body.skip(h)
+					}
+				}
+			case OpMeasure:
+				m.Measure = ""
+				for {
+					f, h, ok := body.next()
+					if !ok {
+						break
+					}
+					switch f {
+					case 1:
+						m.Measure = body.text(h)
+					default:
+						body.skip(h)
+					}
+				}
+			case OpBringBack, OpDiscard:
+				m.KeptID = 0
+				for {
+					f, h, ok := body.next()
+					if !ok {
+						break
+					}
+					switch f {
+					case 1:
+						m.KeptID = body.uint(h)
+					default:
+						body.skip(h)
+					}
 				}
 			case OpNext, OpCloseCursor:
 				m.Cursor = 0
@@ -1155,6 +1321,10 @@ const (
 	ResultStats      Result = 11
 	ResultUsers      Result = 12
 	ResultIdentities Result = 13
+	ResultStream     Result = 14
+	ResultReport     Result = 15
+	ResultKept       Result = 16
+	ResultDatabases  Result = 17
 )
 
 // Response is the answer to one request. Result says which, and the field of that name holds it.
@@ -1187,6 +1357,57 @@ type Response struct {
 	Users []User
 	// Identities holds the identities of ResultIdentities.
 	Identities []Identity
+	// Stream is a part of a backup or of an export.
+	Stream Stream
+	// Report is what an import did.
+	Report Report
+	// Kept holds the kept directories of ResultKept.
+	Kept []KeptEntry
+	// Databases holds the databases of ResultDatabases.
+	Databases []DatabaseEntry
+}
+
+// Stream is a part of a stream of bytes. When Cursor is not zero the stream goes on, and Next
+// pulls its next part. Data lies in the message it was decoded from.
+type Stream struct {
+	Data   []byte
+	Cursor uint64
+}
+
+// Report is what an import did. Stopped is the line the import stopped at, when it stopped at
+// one it refused: its Line is zero otherwise.
+type Report struct {
+	Lines     int64
+	Documents int64
+	Indexes   uint32
+	Refused   int64
+	Refusals  []Refusal
+	Stopped   Refusal
+}
+
+// Refusal is a line of an import that was refused, and why.
+type Refusal struct {
+	Line  int64
+	Error Error
+}
+
+// KeptEntry is a directory that was a database's until the database was replaced, and is kept
+// for a time. The times are nanoseconds since 1970.
+type KeptEntry struct {
+	ID      uint64
+	Name    string
+	Created int64
+	At      int64
+	Until   int64
+	Bytes   int64
+}
+
+// DatabaseEntry is a database as a list with details shows one. Created is nanoseconds since
+// 1970.
+type DatabaseEntry struct {
+	Name    string
+	Created int64
+	Bytes   int64
 }
 
 // Identity is an identity of the server as a list of them shows one: who, what it may do, and
@@ -1434,6 +1655,40 @@ func (m *Error) decode(d *decoder) {
 				}
 			}
 			d.bad = d.bad || body.bad
+		default:
+			d.skip(how)
+		}
+	}
+}
+
+// put writes the refusal as the field, written always: it is an element of a list, or the
+// member that says the import stopped.
+func (m *Refusal) put(b []byte, field int) []byte {
+	var at, in int
+	b, at = open(b, field)
+	b = putUint(b, 1, uint64(m.Line))
+	b, in = open(b, 2)
+	b = shut(m.Error.append(b), in)
+	return shut(b, at)
+}
+
+func (m *Refusal) decode(d *decoder) {
+	*m = Refusal{}
+	for {
+		field, how, ok := d.next()
+		if !ok {
+			return
+		}
+		switch field {
+		case 1:
+			m.Line = int64(d.uint(how))
+		case 2:
+			in, ok := d.inner(how)
+			if !ok {
+				continue
+			}
+			m.Error.decode(&in)
+			d.bad = d.bad || in.bad
 		default:
 			d.skip(how)
 		}
@@ -1879,6 +2134,53 @@ func (m *Response) Append(b []byte) []byte {
 			b = shut(b, one)
 		}
 		return shut(b, at)
+	case ResultStream:
+		var at int
+		b, at = open(b, 14)
+		b = putBytes(b, 1, m.Stream.Data)
+		b = putUint(b, 2, m.Stream.Cursor)
+		return shut(b, at)
+	case ResultReport:
+		var at int
+		b, at = open(b, 15)
+		b = putUint(b, 1, uint64(m.Report.Lines))
+		b = putUint(b, 2, uint64(m.Report.Documents))
+		b = putUint(b, 3, uint64(m.Report.Indexes))
+		b = putUint(b, 4, uint64(m.Report.Refused))
+		for i := range m.Report.Refusals {
+			b = m.Report.Refusals[i].put(b, 5)
+		}
+		if m.Report.Stopped.Line != 0 {
+			b = m.Report.Stopped.put(b, 6)
+		}
+		return shut(b, at)
+	case ResultKept:
+		var at int
+		b, at = open(b, 16)
+		for i := range m.Kept {
+			var one int
+			b, one = open(b, 1)
+			b = putUint(b, 1, m.Kept[i].ID)
+			b = putString(b, 2, m.Kept[i].Name)
+			b = putFixed64(b, 3, uint64(m.Kept[i].Created))
+			b = putFixed64(b, 4, uint64(m.Kept[i].At))
+			b = putFixed64(b, 5, uint64(m.Kept[i].Until))
+			b = putUint(b, 6, uint64(m.Kept[i].Bytes))
+			b = shut(b, one)
+		}
+		return shut(b, at)
+	case ResultDatabases:
+		var at int
+		b, at = open(b, 17)
+		for i := range m.Databases {
+			var one int
+			b, one = open(b, 1)
+			b = putString(b, 1, m.Databases[i].Name)
+			b = putFixed64(b, 2, uint64(m.Databases[i].Created))
+			b = putUint(b, 3, uint64(m.Databases[i].Bytes))
+			b = shut(b, one)
+		}
+		return shut(b, at)
 	case ResultBatch:
 		// And so is a batch.
 		size := m.Batch.size()
@@ -2188,6 +2490,164 @@ func (m *Response) Decode(b []byte) bool {
 					}
 				}
 				m.Identities = append(m.Identities, i)
+				body.bad = body.bad || one.bad
+			}
+			d.bad = d.bad || body.bad
+		case ResultStream:
+			body, ok := d.inner(how)
+			if !ok {
+				continue
+			}
+			m.Result, m.Stream = ResultStream, Stream{}
+			for {
+				f, h, ok := body.next()
+				if !ok {
+					break
+				}
+				switch f {
+				case 1:
+					m.Stream.Data = body.bytes(h)
+				case 2:
+					m.Stream.Cursor = body.uint(h)
+				default:
+					body.skip(h)
+				}
+			}
+			d.bad = d.bad || body.bad
+		case ResultReport:
+			body, ok := d.inner(how)
+			if !ok {
+				continue
+			}
+			m.Result = ResultReport
+			m.Report = Report{Refusals: m.Report.Refusals[:0]}
+			for {
+				f, h, ok := body.next()
+				if !ok {
+					break
+				}
+				switch f {
+				case 1:
+					m.Report.Lines = int64(body.uint(h))
+				case 2:
+					m.Report.Documents = int64(body.uint(h))
+				case 3:
+					m.Report.Indexes = body.u32(h)
+				case 4:
+					m.Report.Refused = int64(body.uint(h))
+				case 5:
+					one, ok := body.inner(h)
+					if !ok {
+						continue
+					}
+					if !body.take(unsafe.Sizeof(Refusal{})) {
+						continue
+					}
+					var r Refusal
+					r.decode(&one)
+					m.Report.Refusals = append(m.Report.Refusals, r)
+					body.bad = body.bad || one.bad
+				case 6:
+					one, ok := body.inner(h)
+					if !ok {
+						continue
+					}
+					m.Report.Stopped.decode(&one)
+					body.bad = body.bad || one.bad
+				default:
+					body.skip(h)
+				}
+			}
+			d.bad = d.bad || body.bad
+		case ResultKept:
+			body, ok := d.inner(how)
+			if !ok {
+				continue
+			}
+			m.Result, m.Kept = ResultKept, m.Kept[:0]
+			for {
+				f, h, ok := body.next()
+				if !ok {
+					break
+				}
+				if f != 1 {
+					body.skip(h)
+					continue
+				}
+				one, ok := body.inner(h)
+				if !ok {
+					continue
+				}
+				if !body.take(unsafe.Sizeof(KeptEntry{})) {
+					continue
+				}
+				var k KeptEntry
+				for {
+					f, h, ok := one.next()
+					if !ok {
+						break
+					}
+					switch f {
+					case 1:
+						k.ID = one.uint(h)
+					case 2:
+						k.Name = one.text(h)
+					case 3:
+						k.Created = int64(one.fixed64(h))
+					case 4:
+						k.At = int64(one.fixed64(h))
+					case 5:
+						k.Until = int64(one.fixed64(h))
+					case 6:
+						k.Bytes = int64(one.uint(h))
+					default:
+						one.skip(h)
+					}
+				}
+				m.Kept = append(m.Kept, k)
+				body.bad = body.bad || one.bad
+			}
+			d.bad = d.bad || body.bad
+		case ResultDatabases:
+			body, ok := d.inner(how)
+			if !ok {
+				continue
+			}
+			m.Result, m.Databases = ResultDatabases, m.Databases[:0]
+			for {
+				f, h, ok := body.next()
+				if !ok {
+					break
+				}
+				if f != 1 {
+					body.skip(h)
+					continue
+				}
+				one, ok := body.inner(h)
+				if !ok {
+					continue
+				}
+				if !body.take(unsafe.Sizeof(DatabaseEntry{})) {
+					continue
+				}
+				var e DatabaseEntry
+				for {
+					f, h, ok := one.next()
+					if !ok {
+						break
+					}
+					switch f {
+					case 1:
+						e.Name = one.text(h)
+					case 2:
+						e.Created = int64(one.fixed64(h))
+					case 3:
+						e.Bytes = int64(one.uint(h))
+					default:
+						one.skip(h)
+					}
+				}
+				m.Databases = append(m.Databases, e)
 				body.bad = body.bad || one.bad
 			}
 			d.bad = d.bad || body.bad

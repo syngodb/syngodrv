@@ -143,7 +143,21 @@ var (
 
 // exchange sends the request that is in req and reads its answer into resp. An error of the
 // server is returned as the error it stands for; see errUnsent and errUnanswered for the others.
+//
+// A request that carries a secret (a password, the passphrase of a backup) is forgotten once
+// it was exchanged, and so is the message it was written into: a connection waits in the pool
+// for minutes, and holds nothing there that it has no use for.
 func (cn *conn) exchange(ctx context.Context) error {
+	err := cn.exchanged(ctx)
+	if cn.req.Secret() {
+		cn.req.Forget()
+		clear(cn.out[:cap(cn.out)])
+	}
+	return err
+}
+
+// exchanged is exchange, with the request still in req afterwards.
+func (cn *conn) exchanged(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}

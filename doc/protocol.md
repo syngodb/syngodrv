@@ -147,12 +147,83 @@ Everything travels in frames. A frame is a header of 9 bytes and a payload:
 | `EnsureDatabase`, `DropDatabase`, `Databases` | done, the list | none: an embedded database is a directory |
 | `PutUser`, `RemoveUser`, `Users`, `SetPassword` | done, the list | none: an embedded database has no users |
 | `PutIdentity`, `RemoveIdentity`, `Identities` | done, the list | none |
+| `Backup`, `Export` | a part of a stream | `Backup`, `Export`, to a writer |
+| `Restore`, `Import`, then `Part`, then `End` | done, and for an import its report | `Restore`, `Import`, from a reader |
+| `Compact`, `Measure` | done, a number | `Compact`, and none |
+| `Kept`, `BringBack`, `Discard` | the list, done | none |
 
 Every request but those of the last three rows names its database. **A database is made on
 purpose**, with `EnsureDatabase`: one that is only named is answered `NO_DATABASE`.
 
-What else belongs to the server as a whole (backup and restore) comes with the phases that
-build it, as more requests of the same shape.
+`Databases` answers with the names, or, when it asks for details, with each database's name,
+since when it is one, and what it takes on disk.
+
+## A database as a stream
+
+**Out.** `Backup` answers with the database as bytes that `Restore` reads back, and `Export`
+with lines of JSON that `Import` reads back. Either is the database as it was when the
+request came, whatever is written meanwhile, and is **pulled like the answer of a query**: a
+part, and a cursor when more follows, which `Next` pulls and `CloseCursor` gives up. The
+session may ask other things between two parts. A stream that is not pulled for as long as an
+answer may wait is given up, and pulling it then is answered `STALE`. Both are a reader's: a
+backup holds nothing a reader cannot read. The backup of a server that is encrypted is
+encrypted with that server's passphrase.
+
+**In.** `Restore` and `Import` begin an **upload**. `Part` sends its next bytes, and is
+answered once the server has taken them, which is what holds back a client the server's disk
+cannot follow. `End` ends it.
+
+- **A session has one upload at a time**, and none inside a transaction. Between two parts it
+  may ask other things.
+- **What is open holds room.** A stream that is being pulled and an upload hold memory for as
+  long as they last: what a stream is written through and the document it stands on, the
+  line an import is in the middle of, what a restore has in its hands. That is counted, and
+  kept inside half the room the server has for its requests. One that finds no room is
+  answered `BUSY` with the time to wait, and nothing was done: a `Backup`, an `Export` or a
+  `Restore` that was to begin, or a `Part` whose line is longer than any before it, is sent
+  again as it was. This driver waits and sends it again by itself.
+- **Nothing is kept of an upload that does not end well**: one that fails, one that `End`
+  gives up (`abandon`), one whose session ends, one that is sent nothing for as long as a
+  transaction may stay idle. A `Part` or an `End` of an upload that is no longer there is
+  answered `STALE`.
+- **A restore is all or nothing.** The backup is built beside the databases while it comes,
+  and `End` gives it the name in one step. A database that was there under the name is
+  replaced at that moment: what sessions had open on it (answers, transactions, page tokens)
+  ends with `STALE`, and it is kept for a time (below). What is no backup, or was cut short
+  or altered, is answered `BACKUP`, and nothing is changed.
+- **A backup of another server** that was made under another passphrase is restored by giving
+  that passphrase with `Restore`; a wrong or missing one is answered `PASSPHRASE`. What is
+  restored is encrypted with the passphrase of the server it is restored on. A backup that is
+  not encrypted is encrypted on the way into a server that is. A server that is not encrypted
+  refuses an encrypted backup (`BACKUP`).
+- **An import has two forms.** Without `replace` its lines are added to the database as it
+  is, which a writer may ask: a line the server refuses stops it, what came before stays, and
+  the `Part` that brought the line is answered with the report, which names the line. With
+  `skip_refused` such lines are passed over and listed. With `replace` the lines become the
+  database, all or nothing, as a restore does, which is an administrator's.
+- **An export says where it ends**: its last line says how many lines it holds. With
+  `replace` only a whole export is taken, one that came to that line with so many lines:
+  what was cut short, even between two lines, and what no export wrote, is answered `BACKUP`
+  and changes nothing. Its lines can still be added to a database.
+- **A line is as long as a document may be**, and little more: a longer one is refused like a
+  line whose document is too large, and is not held while it comes. Every text of a report is
+  short: a refusal says why in a few words, never at the length of what it refused.
+- **The disk.** A restore or an import is not begun, and does not go on, when the disk of the
+  data has less room left than the server keeps free: it is answered `NO_SPACE`, and nothing
+  is changed.
+
+**What is kept.** A database that is replaced, by a restore or by an import with `replace`,
+is kept for seven days, for an undo. `Kept`
+lists what is kept, each with a number, the database it was, when it was replaced, until when
+it is kept, and what it takes on disk. `BringBack` gives the name back to what is kept under a
+number: what the name stands for at that moment is kept in its turn. `Discard` removes it now.
+A number nothing is kept under is answered `NO_KEPT`. **A drop keeps nothing**: `DropDatabase`
+removes the database at once, and with it what was kept of it.
+
+**Looking after a database.** `Compact` has it give back the room of what was removed.
+`Measure` sets right what the server takes for the largest document of a collection (see
+"Room" below): it only ever rises otherwise, and a collection whose large documents are gone
+is read as carefully as when it had them. All these are an administrator's.
 
 **Users** are the server's, and not a database's: a user has one role, on every database.
 
@@ -316,8 +387,8 @@ document for `DUPLICATE`, where in the text for `INVALID_QUERY`).
 | Code | The driver returns |
 | --- | --- |
 | `NOT_FOUND` to `CORRUPT` | the error of the public package with that name (`syngo.ErrNotFound`, `*syngo.DuplicateError`, ...) |
-| `UNAUTHENTICATED`, `FORBIDDEN`, `NO_DATABASE`, `NO_USER`, `NO_IDENTITY`, `LAST_ADMIN` | errors of the driver |
-| `STALE` | the driver's concern for a stamp; for a cursor, a token or a transaction, an error of the driver that says what was lost |
+| `UNAUTHENTICATED`, `FORBIDDEN`, `NO_DATABASE`, `NO_USER`, `NO_IDENTITY`, `LAST_ADMIN`, `NO_KEPT`, `NO_SPACE`, `BACKUP`, `PASSPHRASE` | errors of the driver |
+| `STALE` | the driver's concern for a stamp; for a cursor, a token, a transaction or an upload, an error of the driver that says what was lost |
 | `BUSY` | nothing: the driver waits as long as the answer says, and sends again |
 | `CANCELLED` | the error of the program's context |
 | `UNSUPPORTED`, `PROTOCOL`, `INTERNAL` | errors of the driver, with the server's message |
