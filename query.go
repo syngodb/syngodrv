@@ -284,7 +284,16 @@ func (p *pulled) next(ctx context.Context) (docs []*syngo.Document, names []stri
 	req := p.cn.begin(p.q.c.db.name)
 	req.Op, req.Cursor = wire.OpNext, p.cursor
 	if err := p.cn.exchange(ctx); err != nil {
-		p.fail()
+		if !p.cn.broken && p.cursor != 0 {
+			// The request for the next part failed and the connection is whole: the request
+			// never left, or was given up on the way. The answer is still open on the server,
+			// and the connection goes back to the pool, or on with its transaction: the server
+			// is told that nobody takes the rest. A session has only so many answers open, and
+			// one nobody pulls would hold a place until the server gives it up.
+			p.close()
+		} else {
+			p.fail()
+		}
 		return nil, nil, lost(err, true)
 	}
 	docs, names = p.batch()

@@ -213,12 +213,13 @@ cannot follow. `End` ends it.
   is changed.
 
 **What is kept.** A database that is replaced, by a restore or by an import with `replace`,
-is kept for seven days, for an undo. `Kept`
-lists what is kept, each with a number, the database it was, when it was replaced, until when
-it is kept, and what it takes on disk. `BringBack` gives the name back to what is kept under a
-number: what the name stands for at that moment is kept in its turn. `Discard` removes it now.
-A number nothing is kept under is answered `NO_KEPT`. **A drop keeps nothing**: `DropDatabase`
-removes the database at once, and with it what was kept of it.
+is kept for an undo, for as long as the server is set to: seven days unless its operator said
+otherwise, and not at all when the server is set to keep nothing. `Kept` lists what is kept,
+each with a number, the database it was, when it was replaced, until when it is kept, and what
+it takes on disk. `BringBack` gives the name back to what is kept under a number: what the
+name stands for at that moment is kept in its turn. `Discard` removes it now. A number nothing
+is kept under is answered `NO_KEPT`. **A drop keeps nothing**: `DropDatabase` removes the
+database at once, and with it what was kept of it.
 
 **Looking after a database.** `Compact` has it give back the room of what was removed.
 `Measure` sets right what the server takes for the largest document of a collection (see
